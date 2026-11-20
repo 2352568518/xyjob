@@ -1,0 +1,306 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { bon } from "../src/utils/bonProtocol.js";
+import {
+  DAILY_CONFIG_SOURCES,
+  getClaimablePointRewards,
+  getDailyTaskStates,
+  loadDailyTaskConfig,
+  validateDailyTaskConfig,
+} from "../src/utils/dailyTaskState.js";
+
+function officialConfig() {
+  return {
+    DailyTaskConf: {
+      1: { id: 1, completeCondition: 6, completeValue: 3 },
+      8: { id: 8, completeCondition: 13, completeValue: 1 },
+      9: { id: 9, completeCondition: 12, completeValue: 1 },
+    },
+    DayLimitConf: { 1: { id: 1, limit: 20 }, 2: { id: 2, limit: 40 } },
+    WeekLimitConf: { 1: { id: 1, limit: 100 }, 2: { id: 2, limit: 200 } },
+  };
+}
+function role(complete = {}) {
+  return { dailyTask: { dailyTime: 1700000000, complete } };
+}
+
+test("server counters distinguish unfinished, completed-unclaimed and claimed", () => {
+  const config = validateDailyTaskConfig(officialConfig());
+  const states = getDailyTaskStates(role({ 6: 2, 13: 1, 12: -1 }), config);
+  assert.equal(states[0].status, "pending");
+  assert.equal(states[0].remaining, 1);
+  assert.equal(states[1].status, "claimable");
+  assert.equal(states[1].id, 8);
+  assert.equal(states[2].status, "claimed");
+  assert.equal(states[2].id, 9);
+});
+
+test("progress above target requires claiming, not repeating the action", () => {
+  const states = getDailyTaskStates(
+    role({ 6: 20 }),
+    validateDailyTaskConfig(officialConfig()),
+  );
+  assert.equal(states[0].status, "claimable");
+  assert.equal(states[0].remaining, 0);
+});
+
+test("an absent counter in a valid server map means zero; null does not", () => {
+  const config = validateDailyTaskConfig(officialConfig());
+  assert.equal(getDailyTaskStates(role(), config)[0].remaining, 3);
+  assert.throws(
+    () => getDailyTaskStates(role({ 6: null }), config),
+    /进度无效/,
+  );
+});
+
+test("missing or malformed server task data cannot be treated as completed", () => {
+  const config = validateDailyTaskConfig(officialConfig());
+  for (const input of [
+    {},
+    { dailyTask: {} },
+    { dailyTask: { dailyTime: 1, complete: [] } },
+  ]) {
+    assert.throws(() => getDailyTaskStates(input, config), /列表不完整/);
+  }
+  for (const count of [-2, "3", 1.5])
+    assert.throws(
+      () => getDailyTaskStates(role({ 6: count }), config),
+      /进度无效/,
+    );
+});
+
+test("official targets are used instead of client hardcoded thresholds", () => {
+  const raw = officialConfig();
+  raw.DailyTaskConf[1].completeValue = 5;
+  assert.equal(
+    getDailyTaskStates(role({ 6: 3 }), validateDailyTaskConfig(raw))[0]
+      .remaining,
+    2,
+  );
+});
+
+test("invalid or duplicate configuration stops execution", () => {
+  const raw = officialConfig();
+  raw.DailyTaskConf[8].completeCondition = 6;
+  assert.throws(() => validateDailyTaskConfig(raw), /配置无效/);
+  assert.throws(() => validateDailyTaskConfig({}), /配置无效/);
+});
+
+test("point reward selection uses server points and claimed map for daily and weekly rewards", () => {
+  const config = validateDailyTaskConfig(officialConfig());
+  const daily = {
+    dailyPoint: 40,
+    dailyReward: { 1: true },
+    weekPoint: 150,
+    weekReward: {},
+  };
+  assert.deepEqual(getClaimablePointRewards(daily, config.dailyRewards), [2]);
+  assert.deepEqual(
+    getClaimablePointRewards(daily, config.weeklyRewards, true),
+    [1],
+  );
+  assert.throws(
+    () => getClaimablePointRewards({ dailyPoint: 40 }, config.dailyRewards),
+    /不完整/,
+  );
+  assert.throws(
+    () =>
+      getClaimablePointRewards(
+        { dailyPoint: 40, dailyReward: { 1: "true" } },
+        config.dailyRewards,
+      ),
+    /不完整/,
+  );
+});
+
+function bundleManifest() {
+  const native = [];
+  native[10] = 5;
+  native[11] = "17431";
+  // paths 与 uuids 是平行数组：paths["5"] 对应 uuids[5]，必须用稀疏数组对齐索引
+  const uuids = [];
+  uuids[5] = "ffrEZCeQdEDaF8CLPFWVY0";
+  return {
+    paths: { 5: ["configc", 1] },
+    uuids,
+    versions: { native },
+  };
+}
+
+test("config version is verified each run while immutable configuration requests are merged", async () => {
+  let reads = 0;
+  let versions = 0;
+  const store = {
+    async sendMessageWithPromise() {
+      versions++;
+      return { dataBundleVer: "test-config-merge" };
+    },
+  };
+  const binBytes = bon.encode(officialConfig());
+  const fetchConfig = async (url) => {
+    reads++;
+    if (url.includes("/remote/config/config.test-config-merge.json"))
+      return { ok: true, json: async () => bundleManifest() };
+    return { ok: true, arrayBuffer: async () => binBytes.slice().buffer };
+  };
+  const [a, b] = await Promise.all([
+    loadDailyTaskConfig(store, "a", fetchConfig),
+    loadDailyTaskConfig(store, "b", fetchConfig),
+  ]);
+  assert.equal(a, b);
+  // bundle 源一次加载 = 清单 + native 数据 两次请求，并发账号合并后共 2 次
+  assert.equal(reads, 2);
+  assert.equal(versions, 2);
+});
+
+test("failed config reads can be retried and unsafe versions are rejected", async () => {
+  const failedUrls = new Set();
+  const store = {
+    async sendMessageWithPromise() {
+      return { dataBundleVer: "test-config-retry" };
+    },
+  };
+  // 每个候选源第一次请求都失败，模拟 CDN 整体不可用
+  const fetchConfig = async (url) => {
+    if (!failedUrls.has(url)) {
+      failedUrls.add(url);
+      return { ok: false };
+    }
+    return { ok: true, json: async () => officialConfig() };
+  };
+  await assert.rejects(
+    loadDailyTaskConfig(store, "a", fetchConfig),
+    /读取失败/,
+  );
+  assert.equal(failedUrls.size, DAILY_CONFIG_SOURCES.length);
+  // 整体失败后缓存被清空，下一轮可以整体重试
+  await loadDailyTaskConfig(store, "a", fetchConfig);
+  await assert.rejects(
+    loadDailyTaskConfig(
+      {
+        async sendMessageWithPromise() {
+          return { dataBundleVer: "../invalid" };
+        },
+      },
+      "a",
+      fetchConfig,
+    ),
+    /有效/,
+  );
+});
+
+test("loads config via the cocos remote bundle manifest and native BON file", async () => {
+  const store = {
+    async sendMessageWithPromise() {
+      return { dataBundleVer: "test-config-bundle" };
+    },
+  };
+  const manifest = bundleManifest();
+  const binBytes = bon.encode(officialConfig());
+  const requested = [];
+  const fetchConfig = async (url) => {
+    requested.push(url);
+    if (url.endsWith("/remote/config/config.test-config-bundle.json"))
+      return { ok: true, json: async () => manifest };
+    if (
+      /\/remote\/config\/native\/ff\/ffac4642-7907-440d-a17c-08b3c5595634\.17431\.bin$/.test(
+        url,
+      )
+    )
+      return { ok: true, arrayBuffer: async () => binBytes.slice().buffer };
+    return { ok: false };
+  };
+  const config = await loadDailyTaskConfig(store, "a", fetchConfig);
+  assert.equal(config.tasks.length, 3);
+  const bundleUrls = requested.filter((url) => url.includes("/remote/config/"));
+  assert.equal(bundleUrls.length, 2);
+  assert.ok(bundleUrls[0].includes("xxz-xyzw-res.hortorgames.com"));
+  assert.ok(bundleUrls[1].includes("/remote/config/native/ff/"));
+});
+
+test("falls back to the BON configc.bin source when config.json is unavailable", async () => {
+  const requested = [];
+  const store = {
+    async sendMessageWithPromise() {
+      return { dataBundleVer: "test-config-bon" };
+    },
+  };
+  const binBytes = bon.encode(officialConfig());
+  const fetchConfig = async (url) => {
+    requested.push(url);
+    if (url.endsWith("/config.json")) return { ok: false };
+    return {
+      ok: true,
+      arrayBuffer: async () => binBytes.slice().buffer,
+    };
+  };
+  const config = await loadDailyTaskConfig(store, "a", fetchConfig);
+  assert.equal(config.tasks.length, 3);
+  const binUrls = requested.filter((url) => url.endsWith("configc.bin"));
+  assert.equal(binUrls.length, 1);
+  assert.ok(binUrls[0].includes("xxz-xyzw-res.hortorgames.com"));
+});
+
+test("duplicate point-reward IDs are rejected before duplicate claims can be scheduled", () => {
+  for (const name of ["DayLimitConf", "WeekLimitConf"]) {
+    const config = officialConfig();
+    config[name][2].id = config[name][1].id;
+    assert.throws(() => validateDailyTaskConfig(config), /无效/);
+  }
+});
+
+test("an evicted failed config request cannot remove a newer cached request for the same version", async () => {
+  let rejectFirst;
+  let entered;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const requestCounts = new Map();
+  let hung = false;
+  const store = {
+    sendMessageWithPromise: async (id) => ({ dataBundleVer: id }),
+  };
+  const okResponse = () => ({
+    ok: true,
+    json: async () => officialConfig(),
+    arrayBuffer: async () => new ArrayBuffer(0),
+  });
+  const fetchConfig = async (url) => {
+    const count = (requestCounts.get(url) ?? 0) + 1;
+    requestCounts.set(url, count);
+    if (!hung) {
+      hung = true;
+      entered();
+      return new Promise((resolve, reject) => {
+        rejectFirst = reject;
+      });
+    }
+    if (url.includes("cache-race-a")) {
+      // 挂起的旧请求被拒后其余候选一律快速失败；
+      // 并发的新请求只放行 data json 的首次请求，保持"新请求先完成并占住缓存"的竞态原意
+      if (
+        count === 1 &&
+        /xxz-xyzw-res\.hortorgames\.com\/data\/cache-race-a\/config\.json$/.test(
+          url,
+        )
+      )
+        return okResponse();
+      return { ok: false };
+    }
+    return okResponse();
+  };
+  const first = loadDailyTaskConfig(store, "cache-race-a", fetchConfig);
+  const rejected = assert.rejects(first, /first request failed/);
+  await started;
+  await loadDailyTaskConfig(store, "cache-race-b", fetchConfig);
+  await loadDailyTaskConfig(store, "cache-race-a", fetchConfig);
+  rejectFirst(new Error("first request failed"));
+  await rejected;
+  await loadDailyTaskConfig(store, "cache-race-a", fetchConfig);
+  const retriedUrl = [...requestCounts.keys()].find((url) =>
+    /xxz-xyzw-res\.hortorgames\.com\/data\/cache-race-a\/config\.json$/.test(
+      url,
+    ),
+  );
+  assert.equal(requestCounts.get(retriedUrl), 2);
+});

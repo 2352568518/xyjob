@@ -1,0 +1,1650 @@
+/**
+ * XYZW WebSocket 客户端
+ * 基于 readable-xyzw-ws.js 重构，适配本项目架构
+ */
+
+import { $CacheManager } from "@/stores/cache";
+import { onBgTick } from "./bgTicker.js";
+import { g_utils } from "./bonProtocol.js";
+import { sleep } from "./helperTaskRunner.js";
+import { gameLogger, LOG_LEVELS, wsLogger } from "./logger.js";
+
+/** 断线期间发送队列的最大长度，超过后拒绝入队（防止无限堆积） */
+const MAX_SEND_QUEUE_LENGTH = 200;
+/** 自动重连的最大连续次数 */
+const MAX_RECONNECT_ATTEMPTS = 8;
+/** 单次重连的最大退避延迟（ms） */
+const MAX_RECONNECT_DELAY = 30000;
+
+// 仅开发环境把组队命令原始帧录进前端埋点。Vite 会在浏览器构建时静态替换
+// process.env.NODE_ENV；VM 测试 harness 以非模块 Script 加载本文件且没有
+// process 全局，用 try 兜底跳过（import.meta 在该 harness 下是语法错误，不能用）
+const IS_DEV_SEND_TRACE = (() => {
+  try {
+    // eslint-disable-next-line node/prefer-global/process -- 依赖 Vite 对 process.env.NODE_ENV 的静态替换，浏览器代码不能 require("process")
+    return process.env.NODE_ENV === "development";
+  } catch {
+    return false;
+  }
+})();
+
+/**
+ * 错误码映射表
+ * 用于将服务器返回的错误码转换为可读的错误描述
+ */
+const errorCodeMap = {
+  700010: "任务未达成完成条件",
+  1400010: "没有购买该月卡,不能领取每日奖励",
+  12000116: "今日已领取免费奖励",
+  3300060: "扫荡条件不满足",
+  1300050: "请修改您的采购次数",
+  200020: "出了点小问题，请尝试重启游戏解决～",
+  200160: "模块未开启",
+  7500140: "请先输入密码",
+  7500100: "密码输入错误",
+  7500120: "密码输入错误次数已达上限",
+  200400: "操作太快，请稍后再试",
+  400340: "操作过于频繁，请稍后再试",
+  200760: "您当前看到的界面已发生变化，请重新登录",
+  2300190: "今天已经签到过了",
+  2300370: "俱乐部商品购买数量超出上限",
+  400000: "物品不存在",
+  1500020: "能量不足",
+  2300070: "未加入俱乐部",
+  3500020: "没有可领取的奖励",
+  400190: "没有可领取的签到奖励",
+  1000020: "今天已经领取过奖励了",
+  3300050: "购买数量超出限制",
+  700020: "已经领取过这个任务",
+  12400000: "挂机奖励领取过于频繁",
+  2300250: "俱乐部BOSS今日攻打次数已用完",
+  400010: "物品数量不足",
+  7900023: "已达到使用次数上限",
+  12300040: "没有空格子了",
+  12300080: "未达到解锁条件",
+  200330: "无效的ID",
+  1500040: "上座塔的奖励未领取",
+  1500010: "已经全部通关",
+  4800080: "不在规定时间内或未到报名阶段",
+  4800040: "俱乐部没有报名",
+  2100010: "活动未开放",
+};
+
+// 事件节流定义表，根据实际需要调整命令和节流时间
+const CmdDebounceMap = {
+  role_getroleinfo: 1000,
+  system_claimhangupreward: 1000,
+  system_getdatabundlever: 1000,
+};
+
+/** 为日志生成安全的 body 预览，避免控制台再次解析原始对象 */
+const formatBodyForLog = (body) => {
+  if (!body) return "";
+
+  if (body instanceof Uint8Array) {
+    return `[BON:${body.length}b]`;
+  }
+
+  if (Array.isArray(body)) {
+    return `[Array:${body.length}]`;
+  }
+
+  if (typeof body === "object") {
+    const isNumericObject = Object.keys(body).every(
+      (key) => !Number.isNaN(Number.parseInt(key)),
+    );
+    if (isNumericObject) {
+      return `[BON:Object:${Object.keys(body).length}]`;
+    }
+    try {
+      return JSON.stringify(body);
+    } catch {
+      return "[Object]";
+    }
+  }
+
+  return String(body);
+};
+
+/** 命令到响应的映射 - 处理响应命令与原始命令不匹配的情况（模块级常量，热路径复用） */
+const RESPONSE_TO_COMMAND_MAP = {
+  // 1:1 响应映射（优先级高）
+  fight_startpvpresp: "fight_startpvp",
+  activity_getresp: "activity_get",
+  collection_goodslistresp: "collection_goodslist",
+  collection_claimfreerewardresp: "collection_claimfreereward",
+  legion_getarearankresp: "legion_getarearank",
+  legionwar_getgoldmonthwarrankresp: "legionwar_getgoldmonthwarrank",
+  nightmare_getroleinforesp: "nightmare_getroleinfo",
+  fight_startlevelresp: "fight_startlevel",
+  fight_calcleveltimeresp: "fight_calcleveltime",
+  fight_levelresp: "fight_level",
+  studyresp: "study_startgame",
+  role_getroleinforesp: "role_getroleinfo",
+  apex_getroleinforesp: "apex_getroleinfo",
+  apex_getguesslistresp: "apex_getguesslist",
+  apex_guessresp: "apex_guess",
+  apex_get64oppomapresp: "apex_get64oppomap",
+  apex_getvotelistresp: "apex_getvotelist",
+  apex_voteresp: "apex_vote",
+  hero_recruitresp: "hero_recruit",
+  friend_batchresp: "friend_batch",
+  system_claimhanguprewardresp: "system_claimhangupreward",
+  system_hangupupgraderesp: "system_hangupupgrade",
+  item_openboxresp: ["item_openbox", "item_batchclaimboxpointreward"],
+  item_consumeresp: "item_consume",
+  bottlehelper_claimresp: "bottlehelper_claim",
+  bottlehelper_startresp: "bottlehelper_start",
+  bottlehelper_stopresp: "bottlehelper_stop",
+  legion_signinresp: "legion_signin",
+  fight_startbossresp: "fight_startboss",
+  fight_startlegionbossresp: "fight_startlegionboss",
+  fight_startareaarenaresp: "fight_startareaarena",
+  arena_startarearesp: "arena_startarea",
+  arena_getareatargetresp: "arena_getareatarget",
+  arena_getarearankresp: "arena_getarearank",
+  presetteam_saveteamresp: "presetteam_saveteam",
+  presetteam_getinforesp: "presetteam_getinfo",
+  mail_claimallattachmentresp: "mail_claimallattachment",
+  store_buyresp: "store_purchase",
+  store_getpurchaseresp: "store_getpurchase",
+  store_setpurchaseresp: "store_setpurchase",
+  store_getpurchasehistoryresp: "store_getpurchasehistory",
+  system_getdatabundleverresp: "system_getdatabundlever",
+  tower_claimrewardresp: "tower_claimreward",
+  fight_starttowerresp: "fight_starttower",
+  evotowerinforesp: "evotower_getinfo",
+  evotower_fightresp: "evotower_fight",
+  evotower_getlegionjoinmembersresp: "evotower_getlegionjoinmembers",
+  mergeboxinforesp: "mergebox_getinfo",
+  mergebox_claimfreeenergyresp: "mergebox_claimfreeenergy",
+  mergebox_openboxresp: "mergebox_openbox",
+  mergebox_automergeitemresp: "mergebox_automergeitem",
+  mergebox_mergeitemresp: "mergebox_mergeitem",
+  mergebox_claimcostprogressresp: "mergebox_claimcostprogress",
+  mergebox_claimmergeprogressresp: "mergebox_claimmergeprogress",
+  evotower_claimtaskresp: "evotower_claimtask",
+  item_openpackresp: "item_openpack",
+  equipment_quenchresp: "equipment_quench",
+  rank_getserverrankresp: "rank_getserverrank",
+  legion_claimpayloadtaskresp: "legion_claimpayloadtask",
+  legion_claimpayloadtaskprogressresp: "legion_claimpayloadtaskprogress",
+  saltroad_getwartyperesp: "saltroad_getwartype",
+  saltroad_getsaltroadwartotalrankresp: "saltroad_getsaltroadwartotalrank",
+  warguess_getrankresp: "warguess_getrank",
+  warguess_startguessresp: "warguess_startguess",
+  warguess_getguesscoinrewardresp: "warguess_getguesscoinreward",
+  league_getbattlefieldresp: "league_getbattlefield",
+  league_getgroupopponentresp: "league_getgroupopponent",
+  legion_applyjoinresp: "legion_applyjoin",
+  legion_signupresp: "legion_signup",
+  legion_payloadsignupresp: "legion_payloadsignup",
+  legionmatch_rolesignupresp: "legionmatch_rolesignup",
+  legionmatch_signupresp: "legionmatch_signup",
+  legionmatch_getrankresp: "legionmatch_getrank",
+  legionmatch_getbattlerecordresp: "legionmatch_getbattlerecord",
+  pearl_replaceskillresp: "pearl_replaceskill",
+  pearl_exchangeskillresp: "pearl_exchangeskill",
+  pearl_unloadskillresp: "pearl_unloadskill",
+  discount_getdiscountinforesp: "discount_getdiscountinfo",
+  // 升星相关响应映射
+  hero_heroupgradestarresp: "hero_heroupgradestar",
+  hero_heroupgradelevelresp: "hero_heroupgradelevel",
+  hero_heroupgradeorderresp: "hero_heroupgradeorder",
+  book_upgraderesp: "book_upgrade",
+  book_claimpointrewardresp: "book_claimpointreward",
+  // 军团信息
+  legion_getinforesp: "legion_getinfo",
+  legion_getinforresp: "legion_getinfo",
+  club_getinforesp: "club_getinfo",
+  club_gettargetteamresp: "club_gettargetteam",
+  club_attackresp: "club_attack",
+  club_attackmonsterresp: "club_attackmonster",
+  club_taskclaimresp: "club_taskclaim",
+  role_gettargetteamresp: "role_gettargetteam",
+  // 玄武赐福活动响应映射
+  activity_warordergetresp: "activity_warorderget",
+  activity_warorderclaimresp: [
+    "activity_warorderrewardclaim",
+    "activity_warordertaskclaim",
+    "activity_recyclewarorderrewardclaim",
+  ],
+  activity_getlotteryinforesp: "activity_getlotteryinfo",
+  activity_lotteryresp: "activity_lottery",
+  activity_rewardresp: "activity_claimsignreward",
+  // 功法相关响应映射
+  legacy_getinforesp: "legacy_getinfo",
+  legacy_claimhangupresp: "legacy_claimhangup",
+  legacy_beginhangupresp: "legacy_beginhangup",
+  pkroom_getinforesp: "pkroom_getinfo",
+  pkroom_getfightroominforesp: "pkroom_getfightroominfo",
+  pkroom_getfightroomdetailresp: "pkroom_getfightroomdetail",
+  pkroom_appointresp: "pkroom_appoint",
+  legacy_sendgiftresp: "legacy_sendgift",
+  legacy_getgiftsresp: "legacy_getgifts",
+  // 盐杯竞猜响应映射
+  saltcup26_getbetinforesp: "saltcup26_getbetinfo",
+  saltcup26_placebetresp: "saltcup26_placebet",
+  activity_takeegamerewardresp: "activity_startactegame",
+  // 换皮闯关相关响应映射
+  towers_getinforesp: "towers_getinfo",
+  towers_startresp: "towers_start",
+  towers_fightresp: "towers_fight",
+  // 十殿试炼组队
+  matchteam_createresp: "matchteam_create",
+  matchteam_joinresp: "matchteam_join",
+  matchteam_memberprepareresp: "matchteam_memberprepare",
+  matchteam_getteaminforesp: "matchteam_getteaminfo",
+  matchteam_dismissresp: "matchteam_dismiss",
+  matchteam_getrandteamlistresp: "matchteam_getrandteamlist",
+  hero_calcpowerbyteamresp: "hero_calcpowerbyteam",
+  matchteam_openteamresp: "matchteam_openteam",
+  nightmare_setfighterresp: "nightmare_setfighter",
+  nightmare_fightresp: "nightmare_fight",
+  nightmare_leadercompleteresp: "nightmare_leadercomplete",
+  nightmare_getroominforesp: "nightmare_getroominfo",
+  nightmare_restoreresp: "nightmare_restore",
+  queue_getinforesp: "queue_getinfo",
+  nmext_getinforesp: "nmext_getinfo",
+  // 特殊响应映射 - 有些命令有独立响应，有些用同步响应
+  task_claimdailyrewardresp: "task_claimdailyreward",
+  task_claimweekrewardresp: "task_claimweekreward",
+
+  // 同步响应映射（优先级低）
+
+  legion_researchresp: ["legion_research", "legion_resetresearch"],
+  syncresp: [
+    "system_mysharecallback",
+    "task_claimdailypoint",
+    "role_commitpassword",
+    "hero_gointobattle",
+    "hero_gobackbattle",
+    "lordweapon_changedefaultweapon",
+  ],
+  syncrewardresp: [
+    "activity_commonbuygoods",
+    "system_buygold",
+    "discount_claimreward",
+    "card_claimreward",
+    "artifact_lottery",
+    "genie_sweep",
+    "genie_buysweep",
+    "system_signinreward",
+    "system_claimcdkreward",
+    "dungeon_selecthero",
+    "artifact_exchange",
+    "hero_exchange",
+    "hero_rebirth",
+  ],
+};
+
+/**
+ * 命令注册器：保存每个 cmd 的默认体，发送时与 params 合并
+ */
+export class CommandRegistry {
+  constructor(encoder, enc) {
+    this.encoder = encoder;
+    this.enc = enc;
+    this.commands = new Map();
+  }
+
+  /** 注册命令 */
+  register(cmd, defaultBody = {}, options = {}) {
+    this.commands.set(cmd, (ack = 0, seq = 0, params = {}) => ({
+      cmd,
+      ack,
+      seq,
+      time: Date.now(),
+      body: options.rawBody
+        ? { ...defaultBody, ...params }
+        : this.encoder?.bon?.encode
+          ? this.encoder.bon.encode({ ...defaultBody, ...params })
+          : { ...defaultBody, ...params },
+    }));
+    return this;
+  }
+
+  /** 特例：系统心跳的 ack 用的是 "_sys/ack" */
+  registerHeartbeat() {
+    this.commands.set("heart_beat", (ack, seq) => ({
+      cmd: "_sys/ack",
+      ack,
+      seq,
+      time: Date.now(),
+      body: {},
+    }));
+    return this;
+  }
+
+  /** 生成最终可发送的二进制 */
+  encodePacket(raw) {
+    if (this.encoder?.encode && this.enc) {
+      // 使用加密编码
+      return this.encoder.encode(raw, this.enc);
+    } else {
+      // 降级到JSON字符串
+      return JSON.stringify(raw);
+    }
+  }
+
+  /** 构造报文 */
+  build(cmd, ack, seq, params) {
+    const fn = this.commands.get(cmd);
+    if (!fn) throw new Error(`Unknown cmd: ${cmd}`);
+    return fn(ack, seq, params);
+  }
+}
+
+/** 预注册游戏命令 */
+export function registerDefaultCommands(reg) {
+  const registry = reg
+    .registerHeartbeat()
+    // 角色/系统
+    .register("role_getroleinfo", {
+      clientVersion: "2.21.2-fa918e1997301834-wx",
+      inviteUid: 0,
+      platform: "hortor",
+      platformExt: "mix",
+      scene: "",
+    })
+    .register("system_getdatabundlever", { isAudit: false })
+    .register("system_buygold", { buyNum: 1 })
+    .register("system_claimhangupreward")
+    .register("system_hangupupgrade", { upgradeNum: 1 })
+    .register("system_signinreward")
+    .register("system_mysharecallback", { isSkipShareCard: true, type: 2 })
+    .register("system_custom", { key: "", value: 0 })
+    .register("system_claimcdkreward", { key: "", platformType: "h5" })
+
+    // 任务相关
+    .register("task_claimdailypoint", { taskId: 1 })
+    .register("task_claimdailyreward", { rewardId: 0 })
+    .register("task_claimweekreward", { rewardId: 0 })
+
+    // 好友/招募
+    .register("friend_batch", { friendId: 0 })
+    .register("hero_recruit", {
+      byClub: false,
+      recruitNumber: 1,
+      recruitType: 3,
+    })
+    .register("item_openbox", { itemId: 2001, number: 10 })
+    .register("item_batchclaimboxpointreward")
+    .register("item_openpack")
+    .register("item_consume")
+    .register("rank_getserverrank")
+
+    // 竞技场
+    .register("arena_startarea")
+    .register("fight_startlevel") // 获取 battleVersion
+    .register("fight_calcleveltime") // 计算主线关卡战斗时长
+    .register("fight_level", {}, { rawBody: true }) // 结算主线关卡
+    .register("arena_getareatarget", { refresh: false })
+    .register("arena_getarearank")
+
+    // 商店
+    .register("store_goodslist", { storeId: 1 })
+    .register("store_buy", { goodsId: 1 })
+    .register("store_purchase", { goodsId: 1 })
+    .register("store_refresh", { storeId: 1 })
+    .register("store_getpurchase")
+    .register("store_setpurchase", {
+      purchaseCnt: 1,
+      purchaseItemList: [],
+    })
+    .register("store_getpurchasehistory")
+
+    // 军团
+    .register("legion_getinfo")
+    .register("legion_signin")
+    .register("legion_getwarrank")
+    .register("legionwar_getdetails")
+    .register("legion_storebuygoods")
+    .register("legion_kickout")
+    .register("legion_applylist")
+    .register("legion_approveapply")
+    .register("legion_refuseapply")
+    .register("legion_agree")
+    .register("legion_ignore")
+    .register("legion_research")
+    .register("legion_resetresearch")
+
+    .register("legion_getinfobyid")
+    .register("legion_applyjoin", { legionId: 0 })
+    .register("legion_getarearank")
+    .register("saltroad_getsaltroadwartotalrank")
+    .register("legionwar_getgoldmonthwarrank")
+    .register("legion_getopponent")
+    .register("club_attack")
+    .register("club_attackmonster")
+    .register("club_taskclaim")
+    .register("legion_getbattlefield")
+    .register("legion_claimpayloadtask")
+    .register("legion_claimpayloadtaskprogress")
+    .register("saltroad_getwartype")
+    .register("saltroad_getsaltroadwargrouprank")
+    .register("league_getbattlefield")
+    .register("legion_signup") // 盐场报名
+    // 营地挑战 / 俱乐部战（club_gettargetteam 带默认体，避免与前面的无体注册重复）
+    .register("club_getinfo")
+    .register("club_gettargetteam", { targetId: 0 })
+    .register("club_getattackrecord")
+    .register("club_getdefenserecord", { targetId: 0, targetIsMirror: false })
+    .register("club_getgrouprank")
+    .register("club_getrolerank")
+
+    // 邮件
+    .register("mail_getlist", { category: [0, 4, 5], lastId: 0, size: 60 })
+    .register("mail_claimallattachment", { category: 0 })
+    .register("mail_getmtlinfo")
+    .register("mail_getmtlshortinfo")
+
+    // 学习问答
+    .register("study_startgame")
+    .register("study_answer")
+    .register("study_claimreward", { rewardId: 1 })
+
+    // 战斗相关
+    .register("fight_starttower")
+    .register("fight_startboss")
+    .register("fight_startlegionboss")
+    .register("fight_startdungeon")
+    .register("fight_startpvp")
+
+    // 怪异咸将塔
+    .register("evotower_getinfo")
+    .register("evotower_fight")
+    .register("evotower_getlegionjoinmembers")
+    .register("evotower_readyfight")
+    .register("evotower_claimreward")
+    .register("mergebox_getinfo")
+    .register("mergebox_claimfreeenergy")
+    .register("mergebox_openbox")
+    .register("mergebox_automergeitem", { actType: 1 })
+    .register("mergebox_mergeitem", { actType: 1 })
+    .register("mergebox_claimcostprogress", { actType: 1 })
+    .register("mergebox_claimmergeprogress", { actType: 1 })
+    .register("evotower_claimtask", { taskId: 1 })
+    .register("evotower_buyenergy", { energy: 1 })
+    .register("tower_buyenergy", { buyNum: 1 })
+
+    // 瓶子机器人
+    .register("bottlehelper_claim")
+    .register("bottlehelper_start", { bottleType: -1 })
+    .register("bottlehelper_stop", { bottleType: -1 })
+
+    // 军团匹配/营地挑战和签到
+    .register("legionmatch_rolesignup")
+    .register("legionmatch_signup")
+    .register("legionmatch_getrank")
+    .register("legionmatch_getbattlerecord")
+
+    // 钓鱼
+    .register("artifact_lottery", { lotteryNumber: 1, newFree: true, type: 1 })
+    .register("artifact_exchange")
+
+    // 灯神相关
+    .register("genie_sweep", { genieId: 1 })
+    .register("genie_buysweep")
+
+    // 礼包相关
+    .register("discount_claimreward", { discountId: 1 })
+    .register("collection_claimfreereward") // 珍宝阁相关（同一命令只在后面注册一次）
+    .register("card_claimreward", { cardId: 1 })
+
+    // 爬塔相关
+    .register("tower_getinfo")
+    .register("tower_claimreward")
+
+    // 队伍相关
+    .register("presetteam_getinfo")
+    .register("presetteam_setteam")
+    .register("presetteam_saveteam", { teamId: 1 })
+    .register("role_gettargetteam")
+    .register("hero_exchange")
+    .register("hero_gointobattle")
+    .register("hero_gobackbattle")
+    .register("artifact_load")
+    .register("artifact_unload")
+    .register("lordweapon_changedefaultweapon")
+    .register("pearl_replaceskill")
+    .register("pearl_exchangeskill")
+    .register("pearl_unloadskill")
+
+    // 武将升级相关
+    .register("hero_heroupgradelevel") //武将升级
+    .register("hero_heroupgradeorder") //武将进阶
+    .register("hero_rebirth") //武将重新birth
+
+    // 升星相关
+    .register("hero_heroupgradestar")
+    .register("book_upgrade")
+    .register("book_claimpointreward")
+
+    // 排名相关
+    .register("rank_getroleinfo")
+
+    // 梦魇相关
+    .register("nightmare_getroleinfo")
+    .register("dungeon_selecthero")
+    .register("dungeon_buymerchant")
+    // 十殿试炼（NightMare）组队 —— 命令与字段来自 2026-11-10 实机抓包确认
+    .register("matchteam_create", {
+      teamCfgId: 1,
+      setting: {
+        name: "",
+        notice: "",
+        secret: 1,
+        apply: 0,
+        applyList: [],
+        star: 0,
+      },
+      param: 0,
+      custom: {},
+      extParam: 0,
+    })
+    .register("matchteam_join", { teamId: "" })
+    .register("matchteam_memberprepare", { teamId: "" })
+    .register("matchteam_getteaminfo", { teamId: "" })
+    .register("matchteam_dismiss", { teamId: "" })
+    // 十殿开团：队长进入房间（房间号由 nightmare_roominfo_notify 推送，不在返回值里）
+    .register("matchteam_openteam", { teamId: "" })
+    // 十殿战斗：指定上场者 / 发起战斗（服务端模拟，请求体只有 roomId + roleId）/ 队长确认本层完成
+    .register("nightmare_setfighter", { roomId: "", roleId: 0 })
+    .register("nightmare_fight", { roomId: "", roleId: 0 })
+    .register("nightmare_leadercomplete", { roomId: "" })
+    // 房间全量快照：客户端进房间（含从战斗返回）时发，返回 roomInfo（含 boss curMonsterData）
+    .register("nightmare_getroominfo", { roomId: "" })
+    // 恢复（阵亡武将回满）：队长可替队员发，body = { roomId, roleId: 被恢复的人 }
+    .register("nightmare_restore", { roomId: "", roleId: 0 })
+    .register("nightmare_roominfo_notify")
+    .register("nightmare_fightnotify")
+    .register("matchteam_getrandteamlist")
+    // 建队前置：为组队玩法（teamType=3）设置上阵阵容，游戏客户端建队前必发
+    .register("team_setteam", {
+      teamType: 3,
+      battleTeam: {},
+      lordWeaponId: 0,
+      petUId: "",
+      cCMonsterId: 0,
+    })
+    // 建队前置：按当前阵容算战力，游戏在 team_setteam 之前先发这条
+    .register("hero_calcpowerbyteam", {
+      battleTeam: {},
+      lordWeaponId: 0,
+      petUId: "",
+    })
+    .register("matchteam_notify")
+    .register("queue_getinfo")
+    .register("nmext_getinfo")
+    // 活动/任务
+    .register("activity_get")
+    .register("activity_recyclewarorderrewardclaim")
+    // 玄武赐福活动
+    .register("activity_warorderget")
+    .register("activity_warordertaskclaim")
+    .register("activity_warorderrewardclaim")
+    .register("activity_getlotteryinfo")
+    .register("activity_lottery")
+    .register("activity_claimsignreward")
+    .register("activity_commonbuygoods")
+    .register("legion_getpayloadtask")
+    .register("legion_getpayloadkillrecord")
+    .register("legion_getpayloadbf")
+    .register("legion_getpayloadrecord")
+    .register("warguess_getrank")
+    .register("warguess_startguess")
+    .register("warguess_getguesscoinreward")
+    .register("legion_payloadsignup") // 蟠桃报名
+
+    // 比赛房间(竞技大厅对战房间, 抓包确认的读取命令 + 预约命令)
+    .register("pkroom_getinfo")
+    .register("pkroom_getfightroominfo")
+    .register("pkroom_getfightroomdetail")
+    .register("pkroom_appoint")
+
+    // 珍宝阁相关（collection_claimfreereward 已在礼包相关处注册）
+    .register("collection_goodslist")
+
+    // 扭蛋相关
+    .register("gacha_drawreward", { num: 1, isGroup: false })
+
+    // 功法
+    .register("legacy_getinfo")
+    .register("legacy_claimhangup")
+    // 新赛季开始探索(游戏内「开始」按钮, 抓包确认)
+    .register("legacy_beginhangup")
+    // 功法残卷赠送
+    .register("legacy_gift_getlist")
+    .register("legacy_gift_send", { recipientId: 0, itemId: 0, quantity: 0 })
+    .register("legacy_gift_received")
+    // 安全密码验证
+    .register("role_commitpassword", { password: "", passwordType: 1 })
+    // 功法残卷发送
+    .register("legacy_sendgift", { itemCnt: 0, legacyUIds: [], targetId: 0 })
+
+    // 装备淬炼相关
+    .register("equipment_confirm", {
+      heroId: 0,
+      part: 0,
+      quenchId: 0,
+      quenches: {},
+    })
+    .register("equipment_quench", {
+      heroId: 0,
+      part: 0,
+      quenchId: 0,
+      quenches: {},
+      seed: 0,
+      skipOrange: false,
+    })
+    .register("equipment_updatequenchlock", {
+      heroId: 0,
+      part: 0,
+      slot: 0,
+      isLocked: false,
+    })
+
+    .register("discount_getdiscountinfo")
+
+    // 换皮闯关相关
+    .register("towers_getinfo")
+    .register("towers_start")
+    .register("towers_fight")
+
+    //发送游戏内消息
+    .register("system_sendchatmessage")
+
+    // 盐杯竞猜
+    .register("saltcup26_getbetinfo")
+    .register("saltcup26_placebet", { matchId: "", pick: 0 })
+
+    // 换皮闯关领奖
+    .register("activity_startactegame", { actId: 0 })
+    .register("activity_actegamestageclaim", { actId: 0 })
+
+    // 逐鹿盐山竞猜
+    .register("apex_getroleinfo")
+    .register("apex_getguesslist", { scheduleId: 0, idx: 0 })
+    .register("apex_guess", { teamId: "" })
+    .register("apex_get64oppomap", { scheduleId: 0, groupId: 0 })
+    // 逐鹿盐山助威
+    .register("apex_getvotelist", { groupId: 1, round: 0, idx: 0 })
+    .register("apex_vote", { teamId: "", round: 0, voteCnt: 0 })
+    // 逐鹿盐山活跃度任务领取（confId 取值 1~7，抓包确认）
+    .register("apex_taskclaim", { confId: 0 })
+    // 逐鹿盐山竞猜奖励领取（预测成功后领奖，抓包确认）
+    .register("apex_guessclaim", { scheduleId: 0, teamId: "" });
+  registry.commands.set(
+    "fight_startareaarena",
+    (ack = 0, seq = 0, params = {}) => {
+      if (params?.targetId === undefined || params?.targetId === null) {
+        throw new Error("fight_startareaarena requires targetId in params");
+      }
+      // battleVersion 由调用方通过 params 传入
+      const payload = { ...params };
+      const body = registry.encoder?.bon?.encode
+        ? registry.encoder.bon.encode(payload)
+        : payload;
+
+      return {
+        cmd: "fight_startareaarena",
+        ack,
+        seq,
+        time: Date.now(),
+        body,
+      };
+    },
+  );
+
+  registry.commands.set("fight_startpvp", (ack = 0, seq = 0, params = {}) => {
+    // battleVersion 由调用方通过 params 传入
+    const payload = { ...params };
+    const body = registry.encoder?.bon?.encode
+      ? registry.encoder.bon.encode(payload)
+      : payload;
+
+    return {
+      cmd: "fight_startpvp",
+      ack,
+      seq,
+      time: Date.now(),
+      body,
+    };
+  });
+
+  return registry;
+}
+
+/**
+ * XYZW WebSocket 客户端
+ */
+export class XyzwWebSocketClient {
+  constructor({ url, utils, heartbeatMs = 5000, canConnect = () => true }) {
+    this.canConnect = canConnect;
+    this.url = url;
+    this.utils = utils || g_utils;
+    this.enc = this.utils?.getEnc ? this.utils.getEnc("auto") : undefined;
+
+    this.socket = null;
+    this.ack = 0;
+    this.seq = 0;
+    this.wireSeq = 0;
+    // Latest correlated server response time; never infer completion from the browser clock.
+    this.serverTime = undefined;
+    this.sendQueue = [];
+    this.sendQueueTimer = null;
+    this.heartbeatTimer = null;
+    this.heartbeatStartTimer = null;
+    /** 后台兜底：Worker tick 的回调取消函数 */
+    this.offBgHeartbeat = null;
+    /** 上次心跳时间，用于判断后台是否漏发 */
+    this.lastHeartbeatAt = 0;
+    this.reconnectTimer = null;
+    this.reconnectResetTimer = null;
+    this.dialogResetTimer = null;
+    this.heartbeatInterval = heartbeatMs;
+    this.sendCache = $CacheManager.getCache(this.url, { timeout: 1000 });
+
+    this.dialogStatus = false;
+    this.messageListener = null;
+    this.showMsg = false;
+    this.connected = false;
+    this.isReconnecting = false; // 重连状态标志
+    this.reconnectAttempts = 0; // 连续重连次数（成功后归零，用于指数退避）
+
+    this.promises = Object.create(null);
+    // 原始命令 → 等待中的 seq 集合（反向索引，避免每条推送 O(n) 全表扫描）
+    this._pendingByCmd = Object.create(null);
+    this.registry = registerDefaultCommands(
+      new CommandRegistry(this.utils, this.enc),
+    );
+
+    // WebSocket客户端初始化
+
+    // 状态回调
+    this.onConnect = null;
+    this.onDisconnect = null;
+    this.onError = null;
+  }
+
+  /** 初始化连接 */
+  init() {
+    if (!this.canConnect()) return;
+    wsLogger.info(`连接: ${this.url.split("?")[0]}`);
+
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.isReconnecting = false;
+    }
+    if (this.socket) this.disconnect();
+    const socket = new WebSocket(this.url);
+    this.socket = socket;
+    this.serverTime = undefined;
+    this.wireSeq = 0;
+    this.ack = 0;
+
+    socket.onopen = () => {
+      if (this.socket !== socket) return;
+      wsLogger.info("连接成功");
+      this.connected = true;
+      // 连上就清零，下次断开重新从 1 秒起步
+      this.reconnectAttempts = 0;
+      this.isReconnecting = false;
+      // 启动心跳机制
+      this._setupHeartbeat();
+      // 启动消息队列处理
+      this._processQueueLoop();
+      if (this.onConnect) this.onConnect();
+    };
+
+    socket.onmessage = (evt) => {
+      if (this.socket !== socket) return;
+      try {
+        let packet;
+        if (typeof evt.data === "string") {
+          packet = JSON.parse(evt.data);
+        } else if (evt.data instanceof ArrayBuffer) {
+          // 二进制数据需要自动检测并解码
+          packet = this.utils?.parse
+            ? this.utils.parse(evt.data, "auto")
+            : evt.data;
+
+          // 移除特定命令的控制台直出日志，统一用 wsLogger/gameLogger 控制
+        } else if (evt.data instanceof Blob) {
+          // 处理Blob数据
+          // 收到Blob数据
+          evt.data
+            .arrayBuffer()
+            .then((buffer) => {
+              if (this.socket !== socket) return;
+              try {
+                packet = this.utils?.parse
+                  ? this.utils.parse(buffer, "auto")
+                  : buffer;
+                // Blob解析完成
+
+                // 处理消息体解码（ProtoMsg会自动解码）
+                if (packet instanceof Object && packet.rawData !== undefined) {
+                  gameLogger.verbose(
+                    "ProtoMsg Blob消息，使用rawData:",
+                    packet.rawData,
+                  );
+                } else if (packet.body && this.shouldDecodeBody(packet.body)) {
+                  try {
+                    if (this.utils && this.utils.bon && this.utils.bon.decode) {
+                      // 转换body数据为Uint8Array
+                      const bodyBytes = this.convertToUint8Array(packet.body);
+                      if (bodyBytes) {
+                        const decodedBody = this.utils.bon.decode(bodyBytes);
+                        gameLogger.debug(
+                          "BON Blob解码成功:",
+                          packet.cmd,
+                          decodedBody,
+                        );
+                        // 不修改packet.body，而是创建一个新的属性存储解码后的数据
+                        packet.decodedBody = decodedBody;
+                      }
+                    } else {
+                      gameLogger.warn("BON解码器不可用 (Blob)");
+                    }
+                  } catch (error) {
+                    gameLogger.error(
+                      "BON Blob消息体解码失败:",
+                      error.message,
+                      packet.cmd,
+                    );
+                  }
+                }
+
+                // 更新 ack 为服务端最新的 seq（若存在）
+                const actualPacket = packet._raw || packet;
+                const incomingSeq =
+                  typeof actualPacket?.seq === "number"
+                    ? actualPacket.seq
+                    : typeof packet?.seq === "number"
+                      ? packet.seq
+                      : undefined;
+                if (typeof incomingSeq === "number" && incomingSeq >= 0) {
+                  this.ack = incomingSeq;
+                }
+
+                if (this.showMsg) {
+                  // 收到Blob消息
+                }
+
+                // 回调处理
+                if (this.messageListener) {
+                  this.messageListener(packet);
+                }
+
+                // Promise 响应处理
+                if (this.socket === socket) this._handlePromiseResponse(packet);
+              } catch (error) {
+                gameLogger.error("Blob解析失败:", error.message);
+              }
+            })
+            .catch((error) => {
+              if (this.socket === socket) {
+                gameLogger.error("Blob读取失败:", error.message);
+              }
+            });
+          return; // 异步处理，直接返回
+        } else {
+          gameLogger.warn("未知数据类型:", typeof evt.data, evt.data);
+          packet = evt.data;
+        }
+
+        if (this.showMsg) {
+          gameLogger.verbose("收到消息:", packet);
+        }
+
+        // 处理消息体解码（ProtoMsg会自动解码）
+        if (packet instanceof Object && packet.rawData !== undefined) {
+          gameLogger.verbose("ProtoMsg消息，使用rawData:", packet.rawData);
+        } else {
+          // 处理可能存在_raw包装的情况
+          const actualPacket = packet._raw || packet;
+
+          // 更新 ack 为服务端最新的 seq（若存在）
+          const incomingSeq =
+            typeof actualPacket.seq === "number"
+              ? actualPacket.seq
+              : typeof packet.seq === "number"
+                ? packet.seq
+                : undefined;
+          if (typeof incomingSeq === "number" && incomingSeq >= 0) {
+            this.ack = incomingSeq;
+          }
+
+          if (actualPacket.body && this.shouldDecodeBody(actualPacket.body)) {
+            try {
+              if (this.utils && this.utils.bon && this.utils.bon.decode) {
+                // 转换body数据为Uint8Array
+                const bodyBytes = this.convertToUint8Array(actualPacket.body);
+                if (bodyBytes) {
+                  const decodedBody = this.utils.bon.decode(bodyBytes);
+                  gameLogger.debug(
+                    "BON解码成功:",
+                    actualPacket.cmd || packet.cmd,
+                    decodedBody,
+                  );
+                  // 将解码后的数据存储到原始packet中
+                  packet.decodedBody = decodedBody;
+                  // 如果有_raw结构，也存储到_raw中
+                  if (packet._raw) {
+                    packet._raw.decodedBody = decodedBody;
+                  }
+                }
+              } else {
+                gameLogger.warn("BON解码器不可用");
+              }
+            } catch (error) {
+              gameLogger.error(
+                "BON消息体解码失败:",
+                error.message,
+                actualPacket.cmd || packet.cmd,
+              );
+            }
+          }
+        }
+
+        // 回调处理
+        if (this.messageListener) {
+          this.messageListener(packet);
+        }
+
+        // Promise 响应处理
+        if (this.socket === socket) this._handlePromiseResponse(packet);
+      } catch (error) {
+        gameLogger.error("消息处理失败:", error.message);
+      }
+    };
+
+    socket.onclose = (evt) => {
+      if (this.socket !== socket) return;
+      this.socket = null;
+      wsLogger.info(`WebSocket 连接关闭: ${evt.code} ${evt.reason || ""}`);
+      wsLogger.debug("关闭详情:", {
+        code: evt.code,
+        reason: evt.reason || "未提供原因",
+        wasClean: evt.wasClean,
+        timestamp: new Date().toISOString(),
+      });
+      this.connected = false;
+      this._clearTimers();
+      if (this.onDisconnect) this.onDisconnect(evt);
+      if (this.sendCache) {
+        $CacheManager.delCache(this.url);
+      }
+    };
+
+    socket.onerror = (error) => {
+      if (this.socket !== socket) return;
+      wsLogger.error("WebSocket 错误:", error);
+      this.connected = false;
+      this._clearTimers();
+      if (this.onError) this.onError(error);
+    };
+  }
+
+  /** 注册消息回调 */
+  setMessageListener(fn) {
+    this.messageListener = fn;
+  }
+
+  /** 控制台消息开关 */
+  setShowMsg(val) {
+    this.showMsg = !!val;
+  }
+
+  /** 判断是否需要解码body */
+  shouldDecodeBody(body) {
+    if (!body) return false;
+
+    // Uint8Array或Array格式
+    if (body instanceof Uint8Array || Array.isArray(body)) {
+      return true;
+    }
+
+    // 对象格式的数字数组（从图片中看到的格式）
+    if (typeof body === "object" && body.constructor === Object) {
+      // 检查是否是数字键的对象（例如 {"0": 8, "1": 2, ...}）
+      const keys = Object.keys(body);
+      return (
+        keys.length > 0 &&
+        keys.every((key) => !Number.isNaN(+Number.parseInt(key)))
+      );
+    }
+
+    return false;
+  }
+
+  /** 转换body为Uint8Array */
+  convertToUint8Array(body) {
+    if (!body) return null;
+
+    if (body instanceof Uint8Array) {
+      return body;
+    }
+
+    if (Array.isArray(body)) {
+      return new Uint8Array(body);
+    }
+
+    // 对象格式的数字数组转换为Uint8Array
+    if (typeof body === "object" && body.constructor === Object) {
+      const keys = Object.keys(body)
+        .map((k) => Number.parseInt(k))
+        .sort((a, b) => a - b);
+      if (keys.length > 0) {
+        // 循环取最大索引：大数组用 Math.max(...keys) 会栈溢出
+        let maxIndex = keys[0];
+        for (let i = 1; i < keys.length; i++) {
+          if (keys[i] > maxIndex) maxIndex = keys[i];
+        }
+        const arr = Array.from({ length: maxIndex + 1 }, () => 0);
+        for (const [key, value] of Object.entries(body)) {
+          const index = Number.parseInt(key);
+          if (!Number.isNaN(+index) && typeof value === "number") {
+            arr[index] = value;
+          }
+        }
+        gameLogger.debug("转换对象格式body为Uint8Array:", arr.length, "bytes");
+        return new Uint8Array(arr);
+      }
+    }
+
+    return null;
+  }
+
+  /** 尝试为日志解码BON体，成功返回对象 */
+  decodeBodyForLog(body) {
+    if (!body) return null;
+    const decoder = this.utils?.bon?.decode;
+    if (typeof decoder !== "function") return null;
+
+    let bytes = null;
+    if (body instanceof Uint8Array) {
+      bytes = body;
+    } else if (Array.isArray(body)) {
+      bytes = new Uint8Array(body);
+    } else if (this.shouldDecodeBody(body)) {
+      bytes = this.convertToUint8Array(body);
+    }
+
+    if (!bytes) return null;
+
+    try {
+      return decoder(bytes);
+    } catch (error) {
+      gameLogger.warn("日志解析BON失败:", error.message);
+      return null;
+    }
+  }
+
+  /** 重连（指数退避 + 次数上限版本） */
+  reconnect() {
+    if (!this.canConnect()) return;
+    // 防止重复重连
+    if (this.isReconnecting) {
+      wsLogger.debug("重连已在进行中，跳过此次重连请求");
+      return;
+    }
+
+    // 服务器持续不可达时停止重试，避免 2 秒一次的重连风暴；
+    // 上层（token 刷新 / 批量任务）会创建新客户端重新开始
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      wsLogger.error(
+        `WebSocket 重连失败已达上限 (${MAX_RECONNECT_ATTEMPTS})，停止自动重连`,
+      );
+      if (this.onError) {
+        try {
+          this.onError(new Error("重连次数超限，连接已放弃"));
+        } catch (e) {
+          wsLogger.error("重连超限回调执行失败:", e);
+        }
+      }
+      return;
+    }
+
+    this.isReconnecting = true;
+    const attempt = ++this.reconnectAttempts;
+    const delay = Math.min(1000 * 2 ** (attempt - 1), MAX_RECONNECT_DELAY);
+    wsLogger.info(`开始WebSocket重连（第 ${attempt} 次，延迟 ${delay}ms）...`);
+
+    // 先取消旧会话的等待请求与队列，再安排新的重连。
+    this.disconnect();
+    this.isReconnecting = true;
+
+    const reconnectTimer = setTimeout(() => {
+      if (this.reconnectTimer !== reconnectTimer) return;
+      this.reconnectTimer = null;
+      try {
+        this.init();
+      } catch (error) {
+        wsLogger.error("重连初始化失败:", error);
+      } finally {
+        // 无论成功或失败都重置重连状态
+        const resetTimer = setTimeout(() => {
+          if (this.reconnectResetTimer !== resetTimer) return;
+          this.reconnectResetTimer = null;
+          this.isReconnecting = false;
+        }, 2000); // 2秒后允许下次重连
+        this.reconnectResetTimer = resetTimer;
+      }
+    }, delay);
+    this.reconnectTimer = reconnectTimer;
+  }
+
+  /** 断开连接 */
+  disconnect() {
+    const socket = this.socket;
+    this.socket = null;
+    this.connected = false;
+    this._clearTimers();
+    if (socket) {
+      socket.close();
+      // 主动断开后原生 close 事件会被 onclose 的 socket 归属守卫拦掉，
+      // 必须补发 onDisconnect，否则上层（tokenStore）的 connect 锁不会释放，
+      // 该 token 之后的每次建连都会等待锁超时并静默失败
+      if (this.onDisconnect) {
+        try {
+          this.onDisconnect({ code: 4000, reason: "client disconnected" });
+        } catch (error) {
+          wsLogger.error("disconnect 补发 onDisconnect 回调失败:", error);
+        }
+      }
+    }
+  }
+
+  /** debounceSend */
+  // 在 CmdDebounceMap 中的命令会被节流，
+  // 避免短时间内重复发送同一命令导致服务器压力过大或逻辑错误
+  // 例如 "role_getroleinfo" 这种频繁请求角色信息的命令就适合使用 debounceSend
+  // 他会在第一次请求后缓存结果，在指定的 timeout 时间内如果再次请求同一命令，就直接返回缓存的结果，而不是再次发送请求
+  async debounceSend(cmd, ...args) {
+    if (CmdDebounceMap[cmd]) {
+      gameLogger.info(`Debounce 发送命令排期: ${cmd}`);
+      return this.sendCache.get(
+        cmd,
+        async (c) => {
+          gameLogger.info(`Debounce 发送命令执行: ${c}`);
+          return await this.sendWithPromise(cmd, ...args);
+        },
+        {
+          timeout: CmdDebounceMap[cmd],
+        },
+      );
+    } else {
+      return this.sendWithPromise(cmd, ...args);
+    }
+  }
+
+  /** 发送消息 */
+  send(cmd, params = {}, options = {}) {
+    if (!this.connected) {
+      // 断线期间限制入队深度：队列满时直接丢弃，防止断线期间无限堆积、
+      // 重连后一次性发出全部陈旧报文（携带 Promise 的任务会由各自的超时器 reject）
+      if (this.sendQueue.length >= MAX_SEND_QUEUE_LENGTH) {
+        wsLogger.warn(
+          `WebSocket 未连接且发送队列已满 (${this.sendQueue.length})，丢弃消息: ${cmd}`,
+        );
+        return null;
+      }
+      wsLogger.warn(`WebSocket 未连接，消息已入队: ${cmd}`);
+      // 防止频繁重连
+      if (!this.dialogStatus && !this.isReconnecting) {
+        this.dialogStatus = true;
+        wsLogger.info("自动触发重连...");
+        this.reconnect();
+        const dialogTimer = setTimeout(() => {
+          if (this.dialogResetTimer !== dialogTimer) return;
+          this.dialogResetTimer = null;
+          this.dialogStatus = false;
+        }, 2000);
+        this.dialogResetTimer = dialogTimer;
+      }
+    }
+
+    // 移除特定命令的控制台直出日志，统一用 wsLogger 控制
+
+    // 统一在入队时分配 seq，避免与 Promise 版本竞争导致重复
+    const assignedSeq = options.request
+      ? options.request.seq
+      : cmd === "heart_beat"
+        ? 0
+        : ++this.seq;
+
+    const task = {
+      cmd,
+      params,
+      seq: assignedSeq,
+      respKey: options.respKey || cmd,
+      sleep: options.sleep || 0,
+      onSent: options.onSent,
+      request: options.request,
+    };
+
+    this.sendQueue.push(task);
+    return task;
+  }
+
+  /**
+   * Queue a command and wait for its sequence or legacy command response.
+   * @param {string} cmd Registered protocol command.
+   * @param {object} params Command body.
+   * @param {number} timeoutMs Timeout measured from queue admission, in milliseconds.
+   * @returns {Promise<unknown>} Response body; rejects on a server error or timeout.
+   */
+  sendWithPromise(cmd, params = {}, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      if (!this.connected || this.socket?.readyState !== WebSocket.OPEN) {
+        return reject(new Error("WebSocket 连接已关闭"));
+      }
+
+      // 为此请求生成唯一的seq值
+      const requestSeq = ++this.seq;
+
+      // 设置 Promise 状态，使用seq作为键，并登记原始命令反向索引（O(1) 匹配响应）
+      const request = { resolve, reject, originalCmd: cmd, seq: requestSeq };
+      this.promises[requestSeq] = request;
+      (this._pendingByCmd[cmd] ??= new Set()).add(requestSeq);
+
+      // 超时处理
+      const timer = setTimeout(() => {
+        this._rejectRequest(
+          request.seq,
+          new Error(`请求超时: ${cmd} (${timeoutMs}ms)`),
+        );
+      }, timeoutMs);
+      request.timer = timer;
+
+      try {
+        this.send(cmd, params, { request });
+      } catch (error) {
+        this._rejectRequest(requestSeq, error);
+      }
+    });
+  }
+
+  /** 发送心跳 */
+  sendHeartbeat() {
+    this.lastHeartbeatAt = Date.now();
+    wsLogger.verbose("发送心跳消息");
+    this.send("heart_beat", {}, { respKey: "_sys/ack" });
+  }
+
+  /** 获取角色信息 */
+  getRoleInfo(params = {}) {
+    return this.sendWithPromise("role_getroleinfo", params);
+  }
+
+  /** 获取数据版本 */
+  getDataBundleVersion(params = {}) {
+    return this.sendWithPromise("system_getdatabundlever", params);
+  }
+
+  /** 签到 */
+  signIn() {
+    return this.sendWithPromise("system_signinreward");
+  }
+
+  /** 领取日常任务奖励 */
+  claimDailyReward(rewardId = 0) {
+    return this.sendWithPromise("task_claimdailyreward", { rewardId });
+  }
+
+  /** =============== 内部方法 =============== */
+
+  /** 设置心跳 */
+  _setupHeartbeat() {
+    // 延迟3秒后开始发送第一个心跳，避免连接刚建立就发送
+    const socket = this.socket;
+    const heartbeatTimer = setTimeout(() => {
+      if (this.heartbeatStartTimer !== heartbeatTimer) return;
+      this.heartbeatStartTimer = null;
+      if (
+        this.socket === socket &&
+        this.connected &&
+        socket?.readyState === WebSocket.OPEN
+      ) {
+        wsLogger.debug("开始发送首次心跳");
+        this.sendHeartbeat();
+      }
+    }, 3000);
+    this.heartbeatStartTimer = heartbeatTimer;
+
+    // 设置定期心跳
+    this.heartbeatTimer = setInterval(() => {
+      if (
+        this.socket === socket &&
+        this.connected &&
+        socket?.readyState === WebSocket.OPEN
+      ) {
+        this.sendHeartbeat();
+      } else {
+        wsLogger.warn("心跳检查失败: 连接状态异常");
+      }
+    }, this.heartbeatInterval);
+
+    // 后台兜底：浏览器切到后台时上面的 setInterval 会被压到每分钟一次，
+    // 由 Worker 每 1 秒 tick 一次来补发，保证心跳不断、不会被服务端踢线。
+    if (this.offBgHeartbeat) this.offBgHeartbeat();
+    this.offBgHeartbeat = onBgTick(() => {
+      if (this.socket !== socket || !this.connected) return;
+      if (socket?.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - this.lastHeartbeatAt < this.heartbeatInterval) return;
+      wsLogger.debug("后台兜底心跳");
+      this.sendHeartbeat();
+    });
+  }
+
+  /** 队列处理循环 */
+  _processQueueLoop() {
+    if (this.sendQueueTimer) clearInterval(this.sendQueueTimer);
+
+    const socket = this.socket;
+    this.sendQueueTimer = setInterval(async () => {
+      if (!this.sendQueue.length) return;
+      if (
+        this.socket !== socket ||
+        !this.connected ||
+        socket?.readyState !== WebSocket.OPEN
+      )
+        return;
+
+      const task = this.sendQueue.shift();
+      if (!task) return;
+      const request = task.request;
+      if (request && this.promises[request.seq] !== request) return;
+      // Server sequences must be contiguous: cancelled or failed unsent commands use no number.
+      const wireSeq =
+        task.cmd === "heart_beat" && !request ? 0 : this.wireSeq + 1;
+
+      try {
+        // Reserve a server sequence only for this actual send attempt.
+        const raw = this.registry.build(
+          task.cmd,
+          this.ack,
+          wireSeq,
+          task.params,
+        );
+
+        // 发送前日志（仅标准五段）——日志级别低于 INFO 时跳过解码，避免热路径白白多解一次 BON
+        if (
+          raw &&
+          raw.cmd !== "_sys/ack" &&
+          wsLogger.level >= LOG_LEVELS.INFO
+        ) {
+          const decodedBody = this.decodeBodyForLog(raw.body);
+          wsLogger.info("📤 发送报文", {
+            cmd: raw.cmd,
+            ack: raw.ack ?? 0,
+            seq: raw.seq ?? 0,
+            time: raw.time,
+            body: decodedBody ?? formatBodyForLog(raw.body),
+          });
+        }
+
+        // 编码并发送
+        const bin = this.registry.encodePacket(raw);
+
+        // 调试埋点：把本客户端发出的组队命令原始帧也录进前端埋点日志，
+        // 便于和游戏页抓到的同一命令做字节级对比（仅开发环境）
+        if (IS_DEV_SEND_TRACE && /^matchteam_|^team_setteam$/.test(raw.cmd)) {
+          try {
+            const bytes = new Uint8Array(bin);
+            let binary = "";
+            for (let i = 0; i < bytes.length; i += 0x8000) {
+              binary += String.fromCharCode.apply(
+                null,
+                bytes.subarray(i, i + 0x8000),
+              );
+            }
+            fetch("/frontend-log", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                logs: [
+                  {
+                    ts: new Date().toISOString(),
+                    level: "debug",
+                    message: `helper-ws:${raw.cmd}`,
+                    page: "/helper-ws",
+                    meta: {
+                      dir: "out",
+                      kind: "bin",
+                      b64: btoa(binary),
+                      ws: "helper",
+                    },
+                  },
+                ],
+              }),
+            }).catch(() => {});
+          } catch {
+            // 忽略埋点失败
+          }
+        }
+        if (
+          this.socket !== socket ||
+          !this.connected ||
+          socket.readyState !== WebSocket.OPEN
+        ) {
+          throw new Error("WebSocket 连接已关闭");
+        }
+        if (request) {
+          delete this.promises[request.seq];
+          const pendingSet = this._pendingByCmd[request.originalCmd];
+          if (pendingSet) {
+            pendingSet.delete(request.seq);
+            pendingSet.add(wireSeq);
+          }
+          request.seq = wireSeq;
+          this.promises[wireSeq] = request;
+        }
+        socket.send(bin);
+        if (wireSeq !== 0) this.wireSeq = wireSeq;
+
+        if (this.showMsg || task.cmd === "heart_beat") {
+          wsLogger.wsMessage("local", task.cmd, false);
+          if (this.showMsg) {
+            wsLogger.verbose("原始数据:", raw);
+            wsLogger.verbose("编码后数据:", bin);
+            wsLogger.verbose(
+              "编码类型:",
+              typeof bin,
+              bin instanceof Uint8Array ? "Uint8Array (加密)" : "String (明文)",
+            );
+            if (bin instanceof Uint8Array && bin.length > 0) {
+              wsLogger.verbose(
+                `加密验证: 前8字节 [${Array.from(bin.slice(0, 8)).join(", ")}]`,
+              );
+            }
+          }
+        }
+
+        // 触发发送回调
+        if (task.onSent) {
+          try {
+            const meta = {
+              respKey: task.respKey,
+              cmd: task.cmd,
+              seq: raw?.seq ?? task.seq,
+              ack: raw?.ack ?? this.ack,
+              time: raw?.time ?? Date.now(),
+            };
+            task.onSent(meta);
+          } catch (error) {
+            wsLogger.warn("发送回调执行失败:", error);
+          }
+        }
+
+        // 可选延时
+        if (task.sleep) await sleep(task.sleep);
+      } catch (error) {
+        if (request) this._rejectRequest(request.seq, error);
+        wsLogger.error(`发送消息失败: ${task.cmd}`, error);
+      }
+    }, 50);
+  }
+
+  /** 处理 Promise 响应 */
+  _handlePromiseResponse(packet) {
+    // 有编号的旧响应不能通过命令名匹配到另一笔请求，包括未关联的 resp=0。
+    const responseId = packet.resp;
+    const hasSequence =
+      typeof responseId === "number" ||
+      (typeof responseId === "string" && /^\d+$/.test(responseId));
+    if (hasSequence && !this.promises[responseId]) return;
+    if (Number.isFinite(packet.time) && packet.time > 0)
+      this.serverTime = packet.time;
+
+    // 优先使用resp字段进行响应匹配（新的正确方式）
+    if (packet.resp !== undefined && this.promises[packet.resp]) {
+      const promiseData = this.promises[packet.resp];
+      clearTimeout(promiseData.timer);
+      this._deletePromise(packet.resp);
+
+      // 获取响应数据，优先使用 rawData（ProtoMsg 自动解码），然后 decodedBody（手动解码），最后 body
+      const responseBody =
+        packet.rawData !== undefined
+          ? packet.rawData
+          : packet.decodedBody !== undefined
+            ? packet.decodedBody
+            : packet.body;
+
+      if (packet.code === 0 || packet.code === undefined) {
+        promiseData.resolve(responseBody || packet);
+      } else {
+        // 获取错误描述
+        const errorDesc =
+          errorCodeMap[packet.code] || packet.hint || "未知错误";
+
+        const err = new Error(`服务器错误: ${packet.code} - ${errorDesc}`);
+        err.code = packet.code;
+        promiseData.reject(err);
+      }
+      return;
+    }
+
+    // 兼容旧的基于cmd名称的匹配方式（保留为向后兼容）
+    const cmd =
+      packet.cmd || (typeof responseId === "string" ? responseId : undefined);
+    if (!cmd) return;
+    const respCmdKey = typeof cmd === "string" ? cmd.toLowerCase() : cmd;
+
+    // 命令到响应的映射已提升为模块级常量 RESPONSE_TO_COMMAND_MAP
+    // （热路径：每条未带 resp 的推送消息都会走到这里，避免每条消息重建 150 项对象）（支持一对一和一对多映射）
+    // 使用小写进行映射匹配，兼容服务端大小写差异
+    let originalCmds = RESPONSE_TO_COMMAND_MAP[respCmdKey];
+    if (!originalCmds) {
+      originalCmds = [respCmdKey]; // 如果没有映射，使用响应命令本身（小写）
+    } else if (typeof originalCmds === "string") {
+      originalCmds = [originalCmds]; // 转换为数组
+    }
+
+    // 查找对应的 Promise - 通过原始命令反向索引 O(1) 定位（保持先入先出顺序）
+    for (const originalCmd of originalCmds) {
+      const pendingSet = this._pendingByCmd[originalCmd];
+      if (!pendingSet || pendingSet.size === 0) continue;
+
+      const requestId = pendingSet.values().next().value;
+      const promiseData = this.promises[requestId];
+      if (!promiseData) continue;
+
+      clearTimeout(promiseData.timer);
+      this._deletePromise(requestId);
+
+      // 获取响应数据，优先使用 rawData（ProtoMsg 自动解码），然后 decodedBody（手动解码），最后 body
+      const responseBody =
+        packet.rawData !== undefined
+          ? packet.rawData
+          : packet.decodedBody !== undefined
+            ? packet.decodedBody
+            : packet.body;
+
+      // 附加原始命令名到响应对象
+      if (responseBody && typeof responseBody === "object") {
+        responseBody._originalCmd = promiseData.originalCmd;
+      }
+
+      if (packet.code === 0 || packet.code === undefined) {
+        promiseData.resolve(responseBody || packet);
+      } else {
+        // 获取错误描述
+        const errorDesc =
+          errorCodeMap[packet.code] || packet.hint || "未知错误";
+
+        const err = new Error(`服务器错误: ${packet.code} - ${errorDesc}`);
+        err.code = packet.code;
+        promiseData.reject(err);
+      }
+      return;
+    }
+  }
+
+  /**
+   * Cancel an outstanding request and remove its unsent queue entry.
+   * @param {number} requestSeq Current request key, remapped to the wire sequence on send.
+   * @param {Error} error Failure delivered to the caller; sent packets cannot be recalled.
+   */
+  _rejectRequest(requestSeq, error) {
+    const request = this.promises[requestSeq];
+    if (!request) return;
+    clearTimeout(request.timer);
+    this._deletePromise(requestSeq);
+    this.sendQueue = this.sendQueue.filter((task) => task.seq !== requestSeq);
+    request.reject(error);
+  }
+
+  /** 从等待表中移除指定请求（同步维护原始命令反向索引） */
+  _deletePromise(requestId) {
+    const data = this.promises[requestId];
+    if (!data) return;
+    const pendingSet = this._pendingByCmd[data.originalCmd];
+    if (pendingSet) {
+      pendingSet.delete(requestId);
+      if (pendingSet.size === 0) delete this._pendingByCmd[data.originalCmd];
+    }
+    delete this.promises[requestId];
+  }
+
+  /** Cancel the connection's requests, unsent commands and scheduled callbacks. */
+  _clearTimers() {
+    this.sendQueue.length = 0;
+    for (const field of [
+      "heartbeatStartTimer",
+      "reconnectTimer",
+      "reconnectResetTimer",
+      "dialogResetTimer",
+    ]) {
+      clearTimeout(this[field]);
+      this[field] = null;
+    }
+    this.isReconnecting = false;
+    this.dialogStatus = false;
+    for (const [id, request] of Object.entries(this.promises)) {
+      clearTimeout(request.timer);
+      delete this.promises[id];
+      request.reject(new Error("WebSocket 连接已关闭"));
+    }
+    this._pendingByCmd = Object.create(null);
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      if (this.offBgHeartbeat) {
+        this.offBgHeartbeat();
+        this.offBgHeartbeat = null;
+      }
+      this.heartbeatTimer = null;
+    }
+    if (this.sendQueueTimer) {
+      clearInterval(this.sendQueueTimer);
+      this.sendQueueTimer = null;
+    }
+  }
+}
+
+/** 默认导出 */
+export default XyzwWebSocketClient;

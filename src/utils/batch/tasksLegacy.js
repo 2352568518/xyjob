@@ -1,0 +1,559 @@
+/**
+ * 功法类任务
+ * 包含: batchLegacyClaim, batchLegacyGiftSendEnhanced
+ */
+
+/**
+ * 创建功法类任务执行器
+ * @param {object} deps - 依赖项
+ * @returns {object} 任务函数集合
+ */
+export function createTasksLegacy(deps) {
+  const {
+    selectedTokens,
+    tokens,
+    tokenStatus,
+    isRunning,
+    shouldStop,
+    ensureConnection,
+    releaseConnectionSlot,
+    connectionQueue,
+    batchSettings,
+    tokenStore,
+    addLog,
+    message,
+    currentRunningTokenId,
+    recipientIdInput,
+    recipientInfo,
+    securityPassword,
+    giftQuantity,
+    delayConfig,
+  } = deps;
+
+  // 新赛季探索「开始」按钮的真实命令(用户抓包确认: Legacy_BeginHangUpResp)
+  const EXPLORE_START_CMD = "legacy_beginhangup";
+
+  /**
+   * 尝试开始功法探索(等价于游戏内点「开始」)
+   * 先读 hangUpBeginTime 判断是否已在探索中, 已开始则不重复发送(避免重置探索周期)
+   * @returns {boolean} 是否确认已开始(或已在探索中，或暂态不可开始等下轮重试)
+   */
+  const tryStartExplore = async (tokenId, tokenName) => {
+    try {
+      const info = await tokenStore.sendMessageWithPromise(
+        tokenId,
+        "legacy_getinfo",
+        {},
+        10000,
+      );
+      const beginTime = Number(info?.roleLegacy?.hangUpBeginTime || 0);
+      if (beginTime > 0) {
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `${tokenName} 探索已在进行中，跳过开始`,
+          type: "info",
+        });
+        return true;
+      }
+    } catch {
+      // 读取失败则继续尝试直接开始
+    }
+
+    try {
+      await tokenStore.sendMessageWithPromise(
+        tokenId,
+        EXPLORE_START_CMD,
+        {},
+        5000,
+      );
+      addLog({
+        time: new Date().toLocaleTimeString(),
+        message: `${tokenName} 已开始探索(${EXPLORE_START_CMD})，探索周期开始产出残卷`,
+        type: "success",
+      });
+      return true;
+    } catch (err) {
+      const msg = err.message || "";
+      const codeMatch = /服务器错误: (\d+)/.exec(msg);
+      const errorCode = err?.code ?? (codeMatch ? Number(codeMatch[1]) : null);
+      if (errorCode === 200020) {
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `${tokenName} 探索已在进行中`,
+          type: "info",
+        });
+        return true;
+      }
+      if (errorCode === 200160) {
+        // 功法未解锁（小号等级<4001）属正常态，不算失败
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `${tokenName} 功法未解锁（200160），跳过开启探索`,
+          type: "info",
+        });
+        return true;
+      }
+      if (errorCode === 12400160) {
+        // 探索暂不可开始(次数上限/暂态限制)，不算失败，等下轮定时任务重试
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `${tokenName} 探索暂时无法开始（12400160），下轮再试`,
+          type: "warning",
+        });
+        return true;
+      }
+      addLog({
+        time: new Date().toLocaleTimeString(),
+        message: `${tokenName} 开始探索失败: ${msg || "未知错误"}`,
+        type: "error",
+      });
+      return false;
+    }
+  };
+
+  /**
+   * 批量领取功法残卷
+   */
+  const batchLegacyClaim = async () => {
+    if (selectedTokens.value.length === 0) return;
+    isRunning.value = true;
+    shouldStop.value = false;
+
+    selectedTokens.value.forEach((id) => {
+      tokenStatus.value[id] = "waiting";
+    });
+
+    const taskPromises = selectedTokens.value.map(async (tokenId) => {
+      if (shouldStop.value) return;
+      tokenStatus.value[tokenId] = "running";
+
+      const token = tokens.value.find((t) => t.id === tokenId);
+      try {
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `=== 开始领取功法残卷: ${token.name} ===`,
+          type: "info",
+        });
+        await ensureConnection(tokenId);
+
+        // 自愈：探索未开始先开启（与 dailyTaskRunner 同款），否则探索已结束/新账号
+        // 直接领取会报 12400160。getinfo/begin 失败不阻断，仍走 claim 让错误码分级兜底
+        try {
+          const info = await tokenStore.sendMessageWithPromise(
+            tokenId,
+            "legacy_getinfo",
+            {},
+            8000,
+          );
+          if (!Number(info?.roleLegacy?.hangUpBeginTime)) {
+            try {
+              await tokenStore.sendMessageWithPromise(
+                tokenId,
+                "legacy_beginhangup",
+                {},
+                8000,
+              );
+            } catch (beginError) {
+              // 200020 = 探索已在进行中，属正常
+              const beginCode =
+                beginError?.code ??
+                Number(/服务器错误: (\d+)/.exec(beginError.message || "")?.[1]);
+              if (beginCode !== 200020) throw beginError;
+            }
+          }
+        } catch (infoError) {
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `${token.name} 探索状态检查失败，仍尝试直接领取: ${infoError.message}`,
+            type: "warning",
+          });
+        }
+
+        const LegacyClaimHangUpResp = await tokenStore.sendMessageWithPromise(
+          tokenId,
+          "legacy_claimhangup",
+          {},
+          5000,
+        );
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `=== ${token.name} 成功领取功法残卷${LegacyClaimHangUpResp.reward[0].value}，共有${LegacyClaimHangUpResp.role.items[37007].quantity}个`,
+          type: "success",
+        });
+        tokenStatus.value[tokenId] = "completed";
+      } catch (error) {
+        console.error(error);
+        // 200020 = 暂无可领取（挂机无积累）; 12400000 = 领取间隔未到（刚开启探索等）;
+        // 12400160 = 暂时不可领取（探索已结束/未开启等暂态，自愈流程已尝试重开），
+        // 均为正常情况，降级 info 不算失败，等下轮定时任务重试
+        const codeMatch = /服务器错误: (\d+)/.exec(error.message || "");
+        const errorCode =
+          error?.code ?? (codeMatch ? Number(codeMatch[1]) : null);
+        if (
+          errorCode === 200020 ||
+          errorCode === 12400000 ||
+          errorCode === 12400160
+        ) {
+          tokenStatus.value[tokenId] = "completed";
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message:
+              errorCode === 200020
+                ? `${token.name} 暂无可领取的功法残卷（若为新赛季请先用「批量功法残卷开启」开始探索）`
+                : errorCode === 12400000
+                  ? `${token.name} 挂机奖励领取间隔未到，稍后再领`
+                  : `${token.name} 功法残卷暂时不可领取（12400160），下轮再试`,
+            type: "info",
+          });
+        } else {
+          // 小号（等级<4001）功法未解锁，领取失败属正常情况，不打印错误日志
+          let isAltAccount = false;
+          try {
+            const roleInfo = await tokenStore.sendMessageWithPromise(
+              tokenId,
+              "role_getroleinfo",
+              {},
+              8000,
+            );
+            const level = roleInfo?.role?.level;
+            if (level !== undefined && Number(level) < 4001) {
+              isAltAccount = true;
+            }
+          } catch {
+            // 取不到等级时按普通失败处理
+          }
+          if (isAltAccount) {
+            tokenStatus.value[tokenId] = "completed";
+          } else {
+            tokenStatus.value[tokenId] = "failed";
+            addLog({
+              time: new Date().toLocaleTimeString(),
+              message: `=== ${token.name} 领取功法残卷失败: ${error.message || "未知错误"}`,
+              type: "error",
+            });
+          }
+        }
+      } finally {
+        await tokenStore.closeWebSocketConnectionAsync(tokenId);
+        releaseConnectionSlot(tokenId);
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `${token.name} 连接已关闭  (队列: ${connectionQueue.active}/${batchSettings.maxActive})`,
+          type: "info",
+        });
+      }
+    });
+
+    await Promise.all(taskPromises);
+
+    isRunning.value = false;
+    currentRunningTokenId.value = null;
+    message.success("批量领取功法残卷结束");
+  };
+
+  /**
+   * 批量开始功法探索（新赛季「开始」按钮的批量版）
+   */
+  const batchLegacyStartExplore = async () => {
+    if (selectedTokens.value.length === 0) return;
+    isRunning.value = true;
+    shouldStop.value = false;
+
+    selectedTokens.value.forEach((id) => {
+      tokenStatus.value[id] = "waiting";
+    });
+
+    const taskPromises = selectedTokens.value.map(async (tokenId) => {
+      if (shouldStop.value) return;
+      tokenStatus.value[tokenId] = "running";
+
+      const token = tokens.value.find((t) => t.id === tokenId);
+      try {
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `=== 开始功法探索: ${token.name} ===`,
+          type: "info",
+        });
+        await ensureConnection(tokenId);
+
+        const started = await tryStartExplore(tokenId, token.name);
+        tokenStatus.value[tokenId] = "completed";
+        if (!started) {
+          tokenStatus.value[tokenId] = "failed";
+        }
+      } catch (error) {
+        console.error(error);
+        tokenStatus.value[tokenId] = "failed";
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `${token.name} 开始功法探索失败: ${error.message || "未知错误"}`,
+          type: "error",
+        });
+      } finally {
+        await tokenStore.closeWebSocketConnectionAsync(tokenId);
+        releaseConnectionSlot(tokenId);
+        addLog({
+          time: new Date().toLocaleTimeString(),
+          message: `${token.name} 连接已关闭  (队列: ${connectionQueue.active}/${batchSettings.maxActive})`,
+          type: "info",
+        });
+      }
+    });
+
+    await Promise.all(taskPromises);
+
+    isRunning.value = false;
+    currentRunningTokenId.value = null;
+    message.success("批量开始功法探索结束");
+  };
+
+  /**
+   * 增强版批量赠送功法残卷（含完善的验证和错误处理）
+   */
+  const batchLegacyGiftSendEnhanced = async (isScheduledTask = false) => {
+    if (selectedTokens.value.length === 0) {
+      message.warning("请先选择要操作的角色");
+      return;
+    }
+
+    const recipientId = isScheduledTask
+      ? batchSettings.receiverId
+      : recipientIdInput.value;
+    const password = isScheduledTask
+      ? batchSettings.password
+      : securityPassword.value;
+
+    const giftConfig = {
+      recipientId: Number(recipientId),
+      itemId: 37007,
+      quantity: Math.min(giftQuantity.value, 9999) || 0,
+      serverName: recipientInfo.value?.serverName || "",
+      name: recipientInfo.value?.name || "",
+    };
+
+    if (!isScheduledTask) {
+      if (!giftConfig.recipientId || giftConfig.recipientId <= 0) {
+        message.error("请输入有效的接收者ID");
+        return;
+      }
+
+      if (giftConfig.quantity <= 0 || giftConfig.quantity > 9999) {
+        message.error("赠送数量必须在1-9999之间");
+        return;
+      }
+    }
+
+    isRunning.value = true;
+    shouldStop.value = false;
+
+    selectedTokens.value.forEach((id) => {
+      tokenStatus.value[id] = "waiting";
+    });
+
+    let totalSuccess = 0;
+    let totalFailed = 0;
+
+    const taskPromises = selectedTokens.value.map(async (tokenId) => {
+      if (shouldStop.value) return;
+      tokenStatus.value[tokenId] = "running";
+
+      const token = tokens.value.find((t) => t.id === tokenId);
+      let consecutiveErrors = 0;
+      const maxRetries = 2;
+
+      while (consecutiveErrors <= maxRetries && !shouldStop.value) {
+        try {
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== 开始赠送功法残卷: ${token.name} (尝试 ${consecutiveErrors + 1}/${maxRetries + 1}) ===`,
+            type: "info",
+          });
+
+          await ensureConnection(tokenId);
+
+          const roleInfo = await tokenStore.sendGetRoleInfo(tokenId);
+          const legacyFragmentCount =
+            Math.min(
+              roleInfo?.role?.items?.[giftConfig.itemId]?.quantity,
+              9999,
+            ) || 0;
+          if (isScheduledTask) {
+            if (legacyFragmentCount === 0) {
+              // 定时场景 0 残卷=上轮已送完，属最常见的"无事可做"态，不算失败
+              addLog({
+                time: new Date().toLocaleTimeString(),
+                message: `=== ${token.name} 暂无功法残卷可赠送（上轮已送完），跳过 ===`,
+                type: "info",
+              });
+              tokenStatus.value[tokenId] = "completed";
+              break;
+            }
+            const rankroleinfo = await tokenStore.sendMessageWithPromise(
+              tokenId,
+              "rank_getroleinfo",
+              {
+                bottleType: 0,
+                includeBottleTeam: false,
+                isSearch: false,
+                roleId: giftConfig.recipientId,
+              },
+              5000,
+            );
+            giftConfig.serverName = rankroleinfo?.roleInfo?.serverName || "";
+            giftConfig.name = rankroleinfo?.roleInfo?.name || "";
+            if (!rankroleinfo?.roleInfo?.roleId) {
+              addLog({
+                time: new Date().toLocaleTimeString(),
+                message: `=== ${token.name} 赠送功法残卷失败: 接收者${giftConfig.recipientId}不存在`,
+                type: "error",
+              });
+              tokenStatus.value[tokenId] = "failed";
+              totalFailed++;
+              break;
+            }
+            giftConfig.quantity = legacyFragmentCount;
+          }
+
+          if (legacyFragmentCount < giftConfig.quantity) {
+            addLog({
+              time: new Date().toLocaleTimeString(),
+              message: `=== ${token.name} 功法残卷不足，当前拥有: ${legacyFragmentCount}，需要: ${giftConfig.quantity} ===`,
+              type: "error",
+            });
+            tokenStatus.value[tokenId] = "failed";
+            totalFailed++;
+            break;
+          }
+
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== 开始解除安全密码验证 ===`,
+            type: "info",
+          });
+
+          const commitPasswordResp = await tokenStore.sendMessageWithPromise(
+            tokenId,
+            "role_commitpassword",
+            {
+              password,
+              passwordType: 1,
+            },
+            5000,
+          );
+
+          if (!commitPasswordResp) {
+            throw new Error("安全密码验证请求无响应");
+          }
+          if (!commitPasswordResp.role?.statistics?.["que:wh:tm"]) {
+            addLog({
+              time: new Date().toLocaleTimeString(),
+              message: `${token.name} === 密码解除失败,请检查密码是否配置正确 ===`,
+              type: "error",
+            });
+            tokenStatus.value[tokenId] = "failed";
+            totalFailed++;
+            break;
+          }
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== 安全密码验证成功 ===`,
+            type: "success",
+          });
+
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `${token.name} === 开始赠送功法残卷${giftConfig.quantity}个,目标:[${giftConfig.serverName}] ID:${giftConfig.recipientId} ${giftConfig.name} ===`,
+            type: "info",
+          });
+
+          const legacySendGiftResp = await tokenStore.sendMessageWithPromise(
+            tokenId,
+            "legacy_sendgift",
+            {
+              itemCnt: giftConfig.quantity,
+              legacyUIds: [],
+              targetId: giftConfig.recipientId,
+            },
+            5000,
+          );
+
+          if (!legacySendGiftResp) {
+            throw new Error("赠送请求无响应");
+          }
+
+          await tokenStore.sendMessage(tokenId, "role_getroleinfo");
+
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `=== ${token.name} 成功赠送功法残卷${giftConfig.quantity}个给[${giftConfig.serverName}] ID:${giftConfig.recipientId} ${giftConfig.name} ===`,
+            type: "success",
+          });
+
+          tokenStatus.value[tokenId] = "completed";
+          totalSuccess++;
+          break;
+        } catch (error) {
+          consecutiveErrors++;
+          console.error(`赠送失败: ${error.message}`);
+
+          let errorMsg = error.message || "未知错误";
+
+          if (errorMsg.includes("200160")) {
+            errorMsg = "模块未开启";
+          } else if (errorMsg.includes("timeout")) {
+            errorMsg = "请求超时";
+          } else if (errorMsg.includes("网络")) {
+            errorMsg = "网络错误";
+          }
+
+          if (consecutiveErrors <= maxRetries && !shouldStop.value) {
+            addLog({
+              time: new Date().toLocaleTimeString(),
+              message: `=== ${token.name} 赠送功法残卷失败: ${errorMsg}，将在3秒后重试 ===`,
+              type: "warning",
+            });
+            await new Promise((r) => setTimeout(r, delayConfig.long));
+          } else {
+            addLog({
+              time: new Date().toLocaleTimeString(),
+              message: `=== ${token.name} 赠送功法残卷失败: ${errorMsg}，已达最大重试次数 ===`,
+              type: "error",
+            });
+            tokenStatus.value[tokenId] = "failed";
+            totalFailed++;
+            break;
+          }
+        } finally {
+          await tokenStore.closeWebSocketConnectionAsync(tokenId);
+          releaseConnectionSlot(tokenId);
+          addLog({
+            time: new Date().toLocaleTimeString(),
+            message: `${token.name} 连接已关闭  (队列: ${connectionQueue.active}/${batchSettings.maxActive})`,
+            type: "info",
+          });
+        }
+      }
+    });
+
+    await Promise.all(taskPromises);
+
+    isRunning.value = false;
+    currentRunningTokenId.value = null;
+
+    addLog({
+      time: new Date().toLocaleTimeString(),
+      message: `=== 批量赠送功法残卷完成: 成功 ${totalSuccess} 个，失败 ${totalFailed} 个 ===`,
+      type: "success",
+    });
+
+    message.success(
+      `批量赠送功法残卷结束，成功 ${totalSuccess} 个，失败 ${totalFailed} 个`,
+    );
+  };
+
+  return {
+    batchLegacyClaim,
+    batchLegacyStartExplore,
+    batchLegacyGiftSendEnhanced,
+  };
+}

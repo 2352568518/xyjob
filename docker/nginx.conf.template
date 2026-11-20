@@ -1,0 +1,156 @@
+# 注意：本配置使用请求期 DNS 解析（resolver + 变量 proxy_pass）。
+# 原因：proxy_pass 写死 http://api:3000 时，nginx 在配置加载阶段就解析该主机名，
+# 单独运行 web 镜像（无 api 容器）会因解析失败直接退出，导致"一条 docker run"跑不起来。
+# 改为请求期解析后：api 不存在时 nginx 正常启动，仅 /api/* 返回 502，前端不受影响。
+
+# resolver_timeout：默认 bridge 网络无 Docker 内嵌 DNS（127.0.0.11 仅用户自定义网络监听），
+# 单跑 web 镜像时解析 api 会挂起到默认 30s；设 3s 上限，快速返回 502 而非挂死。
+resolver 127.0.0.11 valid=10s ipv6=off;
+resolver_timeout 3s;
+
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location = /api/link-games/manifest {
+        limit_except GET HEAD POST { deny all; }
+        client_max_body_size 64k;
+        proxy_pass https://xxz-xyzw.hortorgames.com/login/manifest;
+        proxy_ssl_server_name on;
+        proxy_set_header Host xxz-xyzw.hortorgames.com;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+        proxy_set_header Origin "";
+        proxy_set_header Referer "";
+        proxy_read_timeout 65s;
+        proxy_redirect off;
+        proxy_hide_header Set-Cookie;
+        proxy_hide_header Location;
+        add_header X-Game-Status $upstream_status always;
+        add_header X-Game-Location $upstream_http_location always;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location ^~ /api/link-games/assets/ {
+        limit_except GET HEAD { deny all; }
+        client_max_body_size 64k;
+        proxy_pass https://xxz-xyzw-res.hortorgames.com/;
+        proxy_ssl_server_name on;
+        proxy_set_header Host xxz-xyzw-res.hortorgames.com;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+        proxy_set_header Origin "";
+        proxy_set_header Referer "";
+        proxy_read_timeout 65s;
+        proxy_redirect off;
+        proxy_hide_header Set-Cookie;
+        proxy_hide_header Location;
+        add_header X-Game-Status $upstream_status always;
+        add_header X-Game-Location $upstream_http_location always;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location ^~ /api/link-games/ali-assets/ {
+        limit_except GET HEAD { deny all; }
+        client_max_body_size 64k;
+        proxy_pass https://xxz-xyzw-alires.hortorgames.com/;
+        proxy_ssl_server_name on;
+        proxy_set_header Host xxz-xyzw-alires.hortorgames.com;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+        proxy_set_header Origin "";
+        proxy_set_header Referer "";
+        proxy_read_timeout 65s;
+        proxy_redirect off;
+        proxy_hide_header Set-Cookie;
+        proxy_hide_header Location;
+        add_header X-Game-Status $upstream_status always;
+        add_header X-Game-Location $upstream_http_location always;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location ^~ /api/link-games/wxmini/ {
+        limit_except GET HEAD { deny all; }
+        client_max_body_size 64k;
+        proxy_pass https://wxmini-resource.hortorgames.com/;
+        proxy_ssl_server_name on;
+        proxy_set_header Host wxmini-resource.hortorgames.com;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+        proxy_set_header Origin "";
+        proxy_set_header Referer "";
+        proxy_read_timeout 65s;
+        proxy_redirect off;
+        proxy_hide_header Set-Cookie;
+        proxy_hide_header Location;
+        add_header X-Game-Status $upstream_status always;
+        add_header X-Game-Location $upstream_http_location always;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location ^~ /api/link-games/scripts/ {
+        limit_except GET HEAD { deny all; }
+        client_max_body_size 64k;
+        proxy_pass https://xyzw11001.baby/;
+        proxy_ssl_server_name on;
+        proxy_set_header Host xyzw11001.baby;
+        proxy_set_header Authorization "";
+        proxy_set_header Cookie "";
+        proxy_set_header Origin "";
+        proxy_set_header Referer "";
+        proxy_read_timeout 65s;
+        proxy_redirect off;
+        proxy_hide_header Set-Cookie;
+        proxy_hide_header Location;
+        add_header X-Game-Status $upstream_status always;
+        add_header X-Game-Location $upstream_http_location always;
+        add_header Cache-Control "no-store" always;
+    }
+
+    # 后台推关：转发到 api 容器（render-backend，与 vite dev 的 /api/pushing 代理同语义）。
+    # 鉴权用 api 容器同一份 API_KEY，由 nginx 官方镜像的 templates envsubst 注入 ${API_KEY}。
+    # 走请求期 DNS 变量（resolver 见文件头），单跑 web 容器无 api 时仅此路由 502，前端不受影响。
+    location ^~ /api/pushing/ {
+        limit_except GET HEAD POST { deny all; }
+        client_max_body_size 1m;
+        set $api_upstream http://api:3000;
+        proxy_pass $api_upstream;
+        proxy_set_header x-api-key "${API_KEY}";
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_read_timeout 65s;
+        proxy_redirect off;
+        add_header Cache-Control "no-store" always;
+    }
+
+    # 前端埋点日志（render-backend 公开接口，落盘 logs/）
+    # WS 报文 base64 后单条可达数十 KB，与后端 express.json limit 1mb 对齐
+    location = /frontend-log {
+        limit_except POST { deny all; }
+        client_max_body_size 1m;
+        set $api_upstream http://api:3000;
+        proxy_pass $api_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_read_timeout 65s;
+        proxy_redirect off;
+    }
+
+    # 十殿实验台回放游戏页原始帧（只读，仅返回 /game 页面上报的条目）
+    location = /frontend-log/recent {
+        limit_except GET { deny all; }
+        set $api_upstream http://api:3000;
+        proxy_pass $api_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_read_timeout 65s;
+        proxy_redirect off;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

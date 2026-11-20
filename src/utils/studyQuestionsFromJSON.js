@@ -1,0 +1,282 @@
+/**
+ * 从 answer.json 文件加载题目数据的答题工具
+ * 用于一键答题功能，从公共目录读取题目数据
+ */
+
+const fetchQuestions = async () => {
+  // Try loading from the app base URL first (supports Vite `base` config / GitHub Pages subpaths),
+  // then fall back to common locations.
+  const base =
+    typeof import.meta !== "undefined" &&
+    import.meta.env &&
+    import.meta.env.BASE_URL
+      ? import.meta.env.BASE_URL
+      : "/";
+
+  const candidates = [
+    `${base.replace(/\/$/, "")}/answer.json`,
+    `/answer.json`,
+    `answer.json`,
+  ];
+
+  for (let i = 0; i < candidates.length; i++) {
+    const url = candidates[i];
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        // try next
+        continue;
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        // If server returned HTML (like a 404 page), skip
+        try {
+          const text = await response.text();
+          console.warn(
+            `studyQuestionsFromJSON: ${url} returned non-JSON response (length ${text.length})`,
+          );
+        } catch (e) {
+          // ignore
+        }
+        continue;
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      // try next candidate
+      console.warn(`studyQuestionsFromJSON: failed to fetch ${url}:`, error);
+      continue;
+    }
+  }
+
+  console.error("❌ 加载答题数据失败: 无法找到 answer.json（尝试了多个路径）");
+  return [];
+};
+
+let queryPromise = fetchQuestions();
+
+/**
+ * 异步加载答题数据
+ * @returns {Promise<Array>} 题目数据数组
+ */
+export async function loadQuestionsData() {
+  return queryPromise;
+}
+
+/**
+ * 题库未命中的题目收集（用于后续补充题库）
+ */
+const unknownQuestions = new Set();
+
+/** 本轮答题的未命中收集：每次开始答题前清空，结束后由 UI 读取展示 */
+const runMissedQuestions = new Set();
+
+/** 开始一轮新的答题：清空本轮未命中记录 */
+export function beginQuestionRun() {
+  runMissedQuestions.clear();
+}
+
+/** 获取本轮答题中题库未命中的题目列表 */
+export function getRunMissedQuestions() {
+  return [...runMissedQuestions];
+}
+
+/** 记录一次未命中（全局收集 + 本轮收集，用于补充题库与 UI 展示） */
+function recordMissedQuestion(question) {
+  const text = String(question).trim();
+  unknownQuestions.add(text);
+  runMissedQuestions.add(text);
+}
+
+// 否定词守卫：一侧含否定词而另一侧不含时，极可能是「是/不是」类措辞相反的变体题。
+// 与错别字容错不同——这种匹配宁可不命中（盲选还有25%概率）也别自信答错
+const NEGATION_CHARS = ["不", "没", "非", "无"];
+const hasNegation = (text) => NEGATION_CHARS.some((c) => text.includes(c));
+
+/**
+ * 获取已收集的未命中题目列表
+ * @returns {string[]} 已收集的未命中题目列表
+ */
+export function getUnknownQuestions() {
+  return [...unknownQuestions];
+}
+
+/**
+ * 归一化题目文本：去空白、统一小写、去标点/引号/书名号等装饰符号
+ * 使「桃园三结义」与"桃园三结义"、全角/半角标点等差异不影响匹配
+ * @param {string} text
+ * @returns {string} 归一化后的题目文本
+ */
+export function normalizeQuestion(text) {
+  if (!text) return "";
+  return String(text)
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(
+      /[，,、。．·？?！!：:；;（(）)「」『』“”"'‘’《》〈〉【】[\]—\-～~]/g,
+      "",
+    );
+}
+
+/**
+ * 字符二元组（bigram）相似度：衡量 b 被 a 覆盖的程度
+ * 用于兜底匹配题库中的错别字/措辞差异（如 马谩/马谡、荀或/荀彧）
+ * @returns {number} 0-1
+ */
+function bigramSimilarity(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
+
+  const grams = new Set();
+  for (let i = 0; i < a.length - 1; i++) {
+    grams.add(a.slice(i, i + 2));
+  }
+
+  let hit = 0;
+  const total = b.length - 1;
+  for (let i = 0; i < total; i++) {
+    if (grams.has(b.slice(i, i + 2))) {
+      hit++;
+    }
+  }
+  return total > 0 ? hit / total : 0;
+}
+
+// 相似度兜底阈值：单字错别字的题目相似度约0.9+，措辞相近但答案相反的题（如 闭月/羞花）约0.6，取0.75区分两者
+const SIMILARITY_THRESHOLD = 0.75;
+// 长度差超过该值的题目不做相似度匹配，避免误匹配
+const MAX_LENGTH_DIFF = 6;
+
+/**
+ * 模糊匹配函数 - 查找题目中的关键词
+ * @param {string} questionFromDB - 数据库中的题目
+ * @param {string} actualQuestion - 实际收到的题目
+ * @param {number} threshold - 匹配阈值（1表示包含匹配）
+ * @returns {boolean} - 是否匹配
+ */
+export function matchQuestion(questionFromDB, actualQuestion, threshold = 1) {
+  if (!questionFromDB || !actualQuestion) return false;
+
+  if (threshold === 1) {
+    const cleanDB = normalizeQuestion(questionFromDB);
+    const cleanActual = normalizeQuestion(actualQuestion);
+    if (!cleanDB || !cleanActual) return false;
+    return cleanActual.includes(cleanDB) || cleanDB.includes(cleanActual);
+  }
+
+  return false;
+}
+
+/**
+ * 查找题目答案
+ * 先精确包含匹配，未命中再用字符相似度兜底（容错题库错别字）
+ * @param {string} question - 题目文本
+ * @returns {Promise<number|null>} - 答案选项(1-4)，未找到返回null
+ */
+export async function findAnswer(question) {
+  try {
+    const questions = await loadQuestionsData();
+
+    if (!questions || questions.length === 0) {
+      // 降噪
+      return null;
+    }
+
+    const target = normalizeQuestion(question);
+    if (!target) return null;
+
+    // 第一轮：包含匹配。收集全部候选而不是首条即返回——
+    // 短题名常是长题的子串且答案可能不同，取最长（最具体）者；
+    // 多候选答案互相冲突且最长者不够突出时视为歧义，宁可不命中
+    const containmentHits = [];
+    for (let i = 0; i < questions.length; i++) {
+      const item = questions[i];
+      if (!item.name || !item.value) continue;
+
+      const name = normalizeQuestion(item.name);
+      if (!name) continue;
+      if (hasNegation(name) !== hasNegation(target)) continue;
+
+      if (target.includes(name) || name.includes(target)) {
+        containmentHits.push({ item, name });
+      }
+    }
+
+    if (containmentHits.length > 0) {
+      containmentHits.sort((a, b) => b.name.length - a.name.length);
+      const top = containmentHits[0];
+      const answerValues = new Set(containmentHits.map((c) => c.item.value));
+      if (answerValues.size > 1 && containmentHits.length >= 2) {
+        const runnerUp = containmentHits[1];
+        if (top.name.length - runnerUp.name.length < 2) {
+          // 歧义：多个不同答案的候选长度接近，无法自信判断
+          recordMissedQuestion(question);
+          return null;
+        }
+      }
+      return top.item.value;
+    }
+
+    // 第二轮：相似度兜底，处理题库与游戏文本的错别字/细微差异
+    let best = null;
+    let bestScore = 0;
+    for (let i = 0; i < questions.length; i++) {
+      const item = questions[i];
+      if (!item.name || !item.value) continue;
+
+      const name = normalizeQuestion(item.name);
+      if (!name) continue;
+      if (hasNegation(name) !== hasNegation(target)) continue;
+      if (Math.abs(name.length - target.length) > MAX_LENGTH_DIFF) continue;
+
+      const score = bigramSimilarity(target, name);
+      if (score > bestScore) {
+        bestScore = score;
+        best = item;
+      }
+    }
+
+    if (best && bestScore >= SIMILARITY_THRESHOLD) {
+      return best.value;
+    }
+
+    // 记录未命中题目，便于后续补充题库
+    recordMissedQuestion(question);
+    return null;
+  } catch (error) {
+    console.error("❌ 查找答案时出错:", error);
+    return null;
+  }
+}
+
+/**
+ * 获取已加载的题目数量
+ * @returns {Promise<number>} 题目数量
+ */
+export async function getQuestionCount() {
+  const questions = await loadQuestionsData();
+  return questions ? questions.length : 0;
+}
+
+/**
+ * 预加载答题数据（可选，用于提前加载）
+ * @returns {Promise<void>}
+ */
+export async function preloadQuestions() {
+  try {
+    await loadQuestionsData();
+    // 降噪
+  } catch (error) {
+    console.error("❌ 答题数据预加载失败:", error);
+  }
+}
+
+/**
+ * 清除缓存，强制重新加载（用于调试）
+ */
+export function clearCache() {
+  queryPromise = fetchQuestions();
+}
